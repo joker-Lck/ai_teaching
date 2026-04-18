@@ -4,10 +4,13 @@ MySQL 数据库初始化脚本
 """
 
 import mysql.connector
-from db_config import DB_CONFIG
+from data.config import get_db_config
 
 def init_database():
     """初始化数据库和表结构"""
+    
+    # 获取配置
+    DB_CONFIG = get_db_config()
     
     # 连接 MySQL（不指定数据库）
     conn = mysql.connector.connect(

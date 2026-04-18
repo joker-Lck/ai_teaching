@@ -5,38 +5,102 @@ import time
 import os
 import json
 from dotenv import load_dotenv
-from db_operations import db
-from qa_db_operations import qa_db
-from rag_knowledge_base import rag_kb  # RAG 知识库
-from document_parser import doc_parser  # 文档解析器
+from data.db_operations import db
+from data.qa_db_operations import qa_db
+from data.rag_knowledge_base import rag_kb
+from data.document_parser import doc_parser
+from data.embedding_service import embedding_service
+from services.animation_service import AnimationService
+from core.ui_components import CustomCSS, PageLayout, UIComponents
+from data.data_manager import LearningDataManager, DatabaseManager, CacheManager
+from core.utils import clean_json_string, format_file_size, extract_urls, truncate_text, safe_get, generate_filename
+from services.qa_service import QAService
+from services.courseware_service import CoursewareService
+from services.knowledge_service import KnowledgeService
+from services.analysis_service import AnalysisService
 from functools import lru_cache
-from logger import info, warning, error, db_connect_success, db_connect_failed, user_login
+from core.logger import info, warning, error, db_connect_success, db_connect_failed, user_login
+import re
+import io
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+matplotlib.rcParams['axes.unicode_minus'] = False
 
-# 加载环境变量
-load_dotenv()
+# 获取 OpenAI 客户端实例
+@st.cache_resource
+def get_openai_client():
+    """创建并缓存 OpenAI 客户端实例"""
+    return OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
 
-# 从环境变量读取配置
-DEFAULT_API_KEY = os.getenv('KIMI_API_KEY', 'sk-devLXA4UVGRWzlLYFzepvtfFT15iDSGmbyMtQrKikj9WhcA6')
-BASE_URL = os.getenv('KIMI_BASE_URL', 'https://api.moonshot.cn/v1')  # Kimi API 地址
+# 数据库连接管理
+@st.cache_resource(ttl=3600)
+def get_database_connections():
+    """缓存数据库连接，1小时内复用"""
+    return DatabaseManager.get_database_connections()
 
-# 初始化学习数据（使用缓存）
+# RAG 知识检索
+@st.cache_data(ttl=300)
+def cached_rag_search(query, limit=2):
+    """优先使用向量检索，降级到全文搜索"""
+    try:
+        # 1. 获取查询向量
+        query_embedding = embedding_service.get_embedding(query)
+        
+        if query_embedding:
+            # 向量检索
+            results = rag_kb.search_documents_by_vector(query_embedding, limit=limit)
+            
+            if results and len(results) > 0:
+                info(f"✅ 向量检索成功：{len(results)} 篇文档")
+                return results
+        
+        # 全文搜索
+        results = rag_kb.search_documents(query, limit=limit)
+        if results:
+            info(f"✅ 全文检索成功：{len(results)} 篇文档")
+        return results if results else []
+    except Exception as e:
+        warning(f"⚠️ RAG 检索失败：{str(e)}")
+        return []
+
+# 文档分页加载
+@st.cache_data(ttl=600)
+def load_rag_documents_paginated(offset=0, limit=20):
+    """分页加载 RAG 文档"""
+    try:
+        docs = rag_kb.get_all_documents(limit=limit, offset=offset)
+        return docs if docs else []
+    except Exception:
+        pass
+    return []
+
+# 加载配置信息
+config = CacheManager.load_env_config()
+DEFAULT_API_KEY = config['api_key']
+BASE_URL = config['base_url']
+
+# 初始化学习数据
 if "learning_data" not in st.session_state:
     st.session_state.learning_data = {
         "questions": [],
         "correct_rate": 0,
         "weak_points": [],
         "study_time": 0,
-        "interactions": []
+        "interactions": [],
+        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# 初始化知识库（使用缓存）
+# 初始化知识库
 if "knowledge_base" not in st.session_state:
     st.session_state.knowledge_base = {
         "documents": [],
         "categories": {}
     }
 
-# 初始化课件生成会话（使用缓存）
+# 初始化课件生成会话
 if "courseware_session" not in st.session_state:
     st.session_state.courseware_session = {
         "topic": "",
@@ -45,31 +109,21 @@ if "courseware_session" not in st.session_state:
         "requirements": [],
         "generated": False,
         "outline": "",
-        "ppt_content": ""
+        "ppt_content": "",
+        "creation_time": None,
+        "last_modified": None
     }
 
-# 数据库连接状态缓存
-# 注意：如果 MySQL 未启动，会显示连接失败警告，但不影响其他功能
+# 数据库连接状态
 if "db_connected" not in st.session_state:
-    try:
-        st.session_state.db_connected = db.connect()
-    except Exception as e:
-        st.session_state.db_connected = False
-        error(f"主数据库连接失败：{str(e)}")
+    # 获取缓存的数据库连接
+    db_connections = get_database_connections()
     
-    try:
-        st.session_state.qa_db_connected = qa_db.connect()
-    except Exception as e:
-        st.session_state.qa_db_connected = False
-        error(f"答疑数据库连接失败：{str(e)}")
+    st.session_state.db_connected = db_connections['main']
+    st.session_state.qa_db_connected = db_connections['qa']
+    st.session_state.rag_kb_connected = db_connections['rag']
     
-    try:
-        st.session_state.rag_kb_connected = rag_kb.connect()
-    except Exception as e:
-        st.session_state.rag_kb_connected = False
-        error(f"RAG 知识库连接失败：{str(e)}")
-    
-    # 记录连接状态（仅在成功时记录）
+    # 记录连接状态
     if st.session_state.db_connected:
         db_connect_success("ai_teaching_assistant")
     
@@ -79,195 +133,58 @@ if "db_connected" not in st.session_state:
     if st.session_state.rag_kb_connected:
         db_connect_success("ai_rag_knowledge")
         
-        # ✅ 从 RAG 数据库恢复文档列表（实现持久化）
+        # 加载所有文档
         try:
             db_docs = rag_kb.get_all_documents(limit=1000)
             
-            # ✅ 用于去重的集合（基于 rag_doc_id）
-            existing_doc_ids = set()
-            
-            for doc in db_docs:
-                rag_doc_id = doc['id']
-                
-                # ✅ 去重：如果已经存在相同的文档 ID，跳过
-                if rag_doc_id in existing_doc_ids:
-                    continue
-                existing_doc_ids.add(rag_doc_id)
-                
-                # 构建文档信息
-                doc_data = doc.get('document_data', {})
-                metadata = doc_data.get('metadata', {})
-                
-                # 兼容不同格式的标题和学科
-                title = metadata.get('title', doc.get('title', '未知文档'))
-                subject = metadata.get('subject', doc.get('subject', '通用'))
-                
-                doc_info = {
-                    "name": title,
-                    "type": metadata.get('file_type', doc.get('file_type', 'unknown')),
-                    "size": 0,
-                    "category": f"📚 {subject}",
-                    "upload_time": metadata.get('upload_time', str(doc.get('upload_time', ''))),
-                    "json_format": True,
-                    "json_data": doc_data,
-                    "json_file_path": doc.get('file_path', ''),
-                    "rag_doc_id": rag_doc_id
-                }
-                
-                st.session_state.knowledge_base["documents"].append(doc_info)
-                
-                # 更新分类统计
-                category = doc_info["category"]
-                if category not in st.session_state.knowledge_base["categories"]:
-                    st.session_state.knowledge_base["categories"][category] = 0
-                st.session_state.knowledge_base["categories"][category] += 1
-            
             if db_docs:
+                documents_batch = []
+                categories_temp = {}
+                existing_doc_ids = set()
+                
+                for doc in db_docs:
+                    rag_doc_id = doc['id']
+                    
+                    if rag_doc_id in existing_doc_ids:
+                        continue
+                    existing_doc_ids.add(rag_doc_id)
+                    
+                    doc_data = doc.get('document_data', {})
+                    metadata = doc_data.get('metadata', {})
+                    
+                    title = metadata.get('title', doc.get('title', '未知文档'))
+                    subject = metadata.get('subject', doc.get('file_type', '通用'))
+                    category = f"📚 {subject}"
+                    
+                    doc_info = {
+                        "name": title,
+                        "type": metadata.get('file_type', doc.get('file_type', 'unknown')),
+                        "size": doc.get('file_size', 0),
+                        "category": category,
+                        "upload_time": metadata.get('upload_time', str(doc.get('upload_time', ''))),
+                        "json_format": True,
+                        "json_data": doc_data,
+                        "json_file_path": doc.get('file_path', ''),
+                        "rag_doc_id": rag_doc_id
+                    }
+                    
+                    documents_batch.append(doc_info)
+                    categories_temp[category] = categories_temp.get(category, 0) + 1
+                
+                st.session_state.knowledge_base["documents"].extend(documents_batch)
+                st.session_state.knowledge_base["categories"].update(categories_temp)
+                
                 info(f"✅ 从 RAG 数据库恢复了 {len(db_docs)} 个文档")
         except Exception as e:
             warning(f"⚠️ 从 RAG 数据库恢复文档失败：{str(e)}")
+    
+    # 从本地备份文件恢复学习数据
+    LearningDataManager.load_learning_data()
 
-# 优化：减少重复的 CSS 渲染
-st.markdown("""
-<style>
-/* 全局背景 - 纯白色 */
-.stApp {
-    background: #ffffff;
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-}
+# 应用 CSS 样式
+st.markdown(CustomCSS.get_custom_css(), unsafe_allow_html=True)
 
-/* 聊天消息样式 */
-.chat-user {
-    background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
-    color: #333;
-    padding: 15px;
-    border-radius: 15px;
-}
-.chat-assistant {
-    background: white;
-    color: #333;
-    padding: 15px;
-    border-radius: 15px;
-}
-
-/* 卡片样式 */
-.card {
-    background: white;
-    border-radius: 12px;
-    padding: 20px;
-    box-shadow: 0 4px 8px rgba(0,0,0,0.05);
-}
-
-/* 状态指示器 */
-.status-indicator {
-    background: linear-gradient(135deg, #ffe0b2 0%, #ffcc80 100%);
-    padding: 15px;
-    border-radius: 10px;
-    color: #555;
-}
-
-/* 输入框样式优化 */
-.stTextInput > div > div > input,
-.stTextArea > div > div > textarea {
-    background-color: white !important;
-    border: 2px solid #4a90e2 !important;
-    border-radius: 8px !important;
-    font-size: 16px !important;
-    padding: 12px !important;
-    box-shadow: 0 2px 4px rgba(74,144,226,0.1) !important;
-}
-.stTextInput > div > div > input:focus,
-.stTextArea > div > div > textarea:focus {
-    border-color: #2196f3 !important;
-    box-shadow: 0 4px 8px rgba(33,150,243,0.2) !important;
-}
-
-/* Selectbox 样式 */
-.stSelectbox > div > div > select {
-    background-color: white !important;
-    border: 2px solid #66bb6a !important;
-    border-radius: 8px !important;
-    font-size: 16px !important;
-    padding: 10px !important;
-}
-
-/* Radio 按钮样式 - 导航菜单 */
-.stRadio > div {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
-.stRadio > label {
-    background-color: #f8f9fa;
-    border: 2px solid #e0e0e0;
-    border-radius: 10px;
-    padding: 14px 18px;
-    margin: 0;
-    cursor: pointer;
-    transition: all 0.3s ease;
-    font-size: 15px;
-    font-weight: 500;
-    color: #555;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-}
-.stRadio > label:hover {
-    background-color: #f0f2f5;
-    border-color: #d0d0d0;
-    transform: translateX(5px);
-    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-}
-.stRadio input[type="radio"]:checked + label {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-color: #667eea;
-    color: white;
-    box-shadow: 0 4px 12px rgba(102,126,234,0.3);
-    font-weight: 600;
-}
-.stRadio input[type="radio"] + label:before {
-    content: '';
-    display: inline-block;
-    width: 0;
-    height: 0;
-    visibility: hidden;
-}
-
-/* 横向单选按钮强制水平排列 */
-div[data-testid="stRadio"] > div {
-    flex-direction: row !important;
-    flex-wrap: wrap;
-    gap: 10px;
-    justify-content: flex-start;
-}
-div[data-testid="stRadio"] > div > label {
-    flex: 0 0 auto !important;
-    white-space: nowrap;
-    margin: 0;
-}
-
-/* 文件上传器样式 */
-.stFileUploader {
-    border: 2px dashed #4a90e2 !important;
-    border-radius: 8px !important;
-    padding: 15px !important;
-    background-color: #f8f9fa !important;
-}
-
-/* 按钮样式 */
-.stButton > button {
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    transition: all 0.3s ease !important;
-}
-
-/* Expander 样式 */
-.streamlit-expanderHeader {
-    border-radius: 8px !important;
-    border: 2px solid #e0e0e0 !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# 页面配置（只执行一次）
+# 页面配置
 st.set_page_config(page_title="多模态 AI 互动式教学智能体", page_icon="🎓", layout="wide")
 
 # 侧边栏
@@ -308,236 +225,287 @@ with st.sidebar:
     )
 
 # 辅助函数
+
 def process_question(question, scenario, learning_data):
-    """处理文本问题 - RAG 知识库优先策略"""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    """处理用户问题 - 使用服务层"""
+    # 初始化 QA 服务
+    qa_service = QAService()
     
-    start_time = time.time()
+    # 调用服务层处理问题
+    result = qa_service.handle_text_question(
+        question=question,
+        scenario=scenario,
+        api_key=DEFAULT_API_KEY,
+        base_url=BASE_URL
+    )
     
-    st.session_state.messages.append({"role": "user", "content": question})
+    # UI 渲染部分保留在主程序中
+    if result["success"]:
+        with st.chat_message("assistant"):
+            st.markdown(result["answer"])
+            
+            if result.get("source_info"):
+                st.caption(result["source_info"])
+            
+            # 显示参考的书籍列表
+            if result.get("rag_docs_found"):
+                with st.expander("📖 查看参考的书籍"):
+                    for doc in result["rag_docs_found"]:
+                        st.markdown(f"- 📚 {doc['title']} ({doc['subject']})")
+            
+            # 检查是否包含链接
+            urls = extract_urls(result["answer"])
+            if urls:
+                st.caption("📎 相关链接：")
+                for url in urls:
+                    st.markdown(f"- {url}")
+            
+            # 提供下载按钮
+            if len(result["answer"]) > 100:
+                file_name = generate_filename("AI_回复", "txt")
+                st.download_button(
+                    label="📥 下载 AI 回复为文本文件",
+                    data=result["answer"],
+                    file_name=file_name,
+                    mime="text/plain",
+                    key=f"download_{len(learning_data.get('questions', []))}"
+                )
+        
+        # 聊天记录已由服务层管理，此处只需保存到学习数据
+        learning_data["questions"].append({
+            "question": question,
+            "answer": result["answer"],
+            "scenario": scenario,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "answered": True,
+            "source": result.get("source_info", "kimi_ai"),
+            "tokens_used": result.get("tokens_used"),
+            "response_time_ms": result.get("response_time_ms"),
+            "rag_docs_count": len(result.get("rag_docs_found", []))
+        })
+        
+        # 每10次问答备份一次
+        if len(learning_data["questions"]) % 10 == 0:
+            LearningDataManager.save_learning_data()
+    else:
+        st.error(f"请求失败：{result.get('error', '未知错误')}")
+
+def process_audio(audio_value, scenario, learning_data):
+    """处理语音输入 - 使用服务层"""
+    # 初始化 QA 服务
+    qa_service = QAService()
     
+    # 模拟语音识别（实际项目中应集成真实的语音识别 API）
+    transcribed_text = f"[语音识别结果] {datetime.now().strftime('%H:%M:%S')} 的语音输入"
+    
+    # UI 显示
     with st.chat_message("user"):
-        st.markdown(question)
+        st.audio(audio_value)
+        st.caption("🎤 语音消息")
     
     with st.chat_message("assistant"):
-        ai_response = None
-        source_info = ""
-        
-        # 第一步：查询 QA 数据库（已有问答记录）
-        try:
-            similar_qa = qa_db.search_similar_questions(question, limit=3)
-            
-            if similar_qa and len(similar_qa) > 0:
-                best_match = similar_qa[0]
-                similarity_score = best_match.get('similarity', 0)
+        with st.spinner("正在识别语音并生成回答..."):
+            try:
+                # 显示转录文本
+                st.markdown(f"**识别到的文本：** {transcribed_text}")
                 
-                if similarity_score > 0.8:  # 高相似度直接返回
-                    ai_response = best_match.get('ai_response', '')
-                    source_info = "💾 来源：历史问答记录"
+                # 调用服务层处理语音问题
+                result = qa_service.handle_voice_question(
+                    transcribed_text=transcribed_text,
+                    api_key=DEFAULT_API_KEY,
+                    base_url=BASE_URL
+                )
+                
+                if result["success"]:
+                    # 显示 AI 回复
+                    st.markdown(result["answer"])
                     
-                    st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                    # 检查是否包含链接
+                    urls = extract_urls(result["answer"])
+                    if urls:
+                        st.caption("📎 相关链接：")
+                        for url in urls:
+                            st.markdown(f"- {url}")
+                    
+                    # 提供下载按钮
+                    if len(result["answer"]) > 100:
+                        file_name = generate_filename("AI_语音回复", "txt")
+                        st.download_button(
+                            label="📥 下载 AI 回复为文本文件",
+                            data=result["answer"],
+                            file_name=file_name,
+                            mime="text/plain",
+                            key=f"download_audio_{len(learning_data.get('questions', []))}"
+                        )
+                    
+                    # 聊天记录已由服务层管理，此处只需保存到学习数据
                     learning_data["questions"].append({
-                        "question": question,
-                        "answer": ai_response,
+                        "question": transcribed_text,
+                        "answer": result["answer"],
                         "scenario": scenario,
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "answered": True,
-                        "source": "database",
-                        "source_id": best_match.get('id')
+                        "input_type": "voice"
                     })
-                    st.markdown(ai_response)
-                    st.caption(source_info)
-                    return
-        except Exception as db_error:
-            pass
-        
-        # 第二步：查询 RAG 知识库（书籍文档）
-        rag_context = ""
-        rag_docs_found = []
-        
-        try:
-            if st.session_state.rag_kb_connected:
-                with st.spinner("🔍 正在知识库中检索..."):
-                    rag_results = rag_kb.search_documents(question, limit=5)
                     
-                    if rag_results:
-                        # 构建知识库上下文
-                        rag_context = "\n\n=== 知识库参考资料 ===\n\n"
-                        for i, doc in enumerate(rag_results[:3], 1):
-                            title = doc.get('title', '未知文档')
-                            subject = doc.get('subject', '未知学科')
-                            content = doc.get('content_text', '')[:1000]  # 每篇文档取前1000字
-                            rag_docs_found.append({"title": title, "subject": subject})
-                            
-                            rag_context += f"📚 参考资料 {i}:《{title}》({subject})\n"
-                            rag_context += f"{content}\n\n"
-                            
-                            # 更新使用次数
-                            rag_kb.update_document_usage(doc['id'])
-                        
-                        rag_context += "=== 参考资料结束 ===\n\n"
-                        source_info = f"📚 参考了 {len(rag_docs_found)} 本书籍"
-        except Exception as rag_error:
-            pass  # RAG 检索失败，静默处理
-        
-        # 第三步：调用 AI 生成回答
-        with st.spinner("思考中..."):
-            try:
-                # 优化：复用 OpenAI 客户端
-                if "client" not in st.session_state:
-                    st.session_state.client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
-                
-                # 构建带知识库上下文的提示词
-                if rag_context:
-                    system_prompt = '''你是一位专业的教育 AI 助手。请根据以下参考资料回答问题。
-要求：
-1. 优先使用参考资料中的信息
-2. 如果参考资料不足以完整回答问题，可以补充你的知识
-3. 回答要准确、清晰、易懂
-4. 如果参考资料中没有相关信息，明确说明“知识库中未找到相关内容”'''
-                    
-                    messages_with_context = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": rag_context + f"\n\n问题：{question}"}
-                    ]
+                    # 每10次问答备份一次
+                    if len(learning_data["questions"]) % 10 == 0:
+                        LearningDataManager.save_learning_data()
                 else:
-                    # 没有知识库内容，直接回答
-                    messages_with_context = st.session_state.messages
-                
-                response = st.session_state.client.chat.completions.create(
-                    model="moonshot-v1-8k",  # Kimi 模型
-                    messages=messages_with_context
-                )
-                
-                end_time = time.time()
-                response_time_ms = int((end_time - start_time) * 1000)
-                tokens_used = response.usage.total_tokens if hasattr(response, 'usage') else None
-                
-                ai_response = response.choices[0].message.content
-                
-                # 显示 AI 回复
-                st.markdown(ai_response)
-                
-                # 显示来源信息
-                if source_info:
-                    st.caption(source_info)
-                
-                # 显示参考的书籍列表
-                if rag_docs_found:
-                    with st.expander("📖 查看参考的书籍"):
-                        for doc in rag_docs_found:
-                            st.markdown(f"- 📚 {doc['title']} ({doc['subject']})")
-                
-                # 检查是否包含链接或图片
-                if "http" in ai_response:
-                    import re
-                    urls = re.findall(r'http[s]?://\S+', ai_response)
-                    if urls:
-                        st.caption("📎 相关链接：")
-                        for url in urls:
-                            st.markdown(f"- {url}")
-                
-                # 提供下载按钮
-                if len(ai_response) > 100:
-                    file_name = f"AI_回复_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                    st.download_button(
-                        label="📥 下载 AI 回复为文本文件",
-                        data=ai_response,
-                        file_name=file_name,
-                        mime="text/plain",
-                        key=f"download_{len(learning_data.get('questions', []))}"
-                    )
-                
-                st.session_state.messages.append({"role": "assistant", "content": ai_response})
-                
-                # 保存聊天记录和数据库
-                learning_data["questions"].append({
-                    "question": question,
-                    "answer": ai_response,
-                    "scenario": scenario,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "answered": True,
-                    "source": "rag_knowledge" if rag_context else "kimi_ai",
-                    "tokens_used": tokens_used,
-                    "response_time_ms": response_time_ms,
-                    "rag_docs_count": len(rag_docs_found)
-                })
-                
-                # 同时将问答记录保存到答疑专用数据库（静默保存）
-                try:
-                    user_id = 1
-                    qa_db.add_qa_record(
-                        user_id=user_id,
-                        question_text=question,
-                        scenario=scenario,
-                        ai_response=ai_response,
-                        model_used='moonshot-v1-8k',
-                        tokens_used=tokens_used,
-                        response_time_ms=response_time_ms
-                    )
-                except Exception as save_error:
-                    pass
+                    st.error(f"语音处理失败：{result.get('error', '未知错误')}")
                     
             except Exception as e:
-                st.error(f"请求失败：{str(e)}")
+                st.error(f"语音处理失败：{str(e)}")
 
-def process_audio(audio_value, scenario, learning_data):
-    """处理语音输入"""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+
+# ==================== 学情分析图表生成函数 ====================
+
+def generate_analysis_charts(questions_data, analysis_mode):
+    """根据学习数据自动生成分析图表"""
+    charts = {}
     
-    st.session_state.messages.append({"role": "user", "content": "[语音消息]"})
+    if not questions_data:
+        return charts
     
-    with st.chat_message("user"):
-        st.audio(audio_value)
+    try:
+        # 1. 互动场景分布饼图
+        scenarios = {}
+        for q in questions_data:
+            scenario = q.get('scenario', '未知')
+            scenarios[scenario] = scenarios.get(scenario, 0) + 1
+        
+        if scenarios:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F']
+            wedges, texts, autotexts = ax.pie(
+                scenarios.values(),
+                labels=scenarios.keys(),
+                autopct='%1.1f%%',
+                colors=colors[:len(scenarios)],
+                startangle=90
+            )
+            ax.set_title('互动场景分布', fontsize=14, fontweight='bold', pad=20)
+            plt.tight_layout()
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            buf.seek(0)
+            charts['scenario_pie'] = buf.getvalue()
+            plt.close()
+        
+        # 2. 时间趋势折线图（按日期统计）
+        date_stats = {}
+        for q in questions_data:
+            time_str = q.get('time', '')
+            if time_str:
+                date_part = time_str.split(' ')[0] if ' ' in time_str else time_str[:10]
+                date_stats[date_part] = date_stats.get(date_part, 0) + 1
+        
+        if len(date_stats) > 1:
+            sorted_dates = sorted(date_stats.keys())
+            counts = [date_stats[d] for d in sorted_dates]
+            
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(sorted_dates, counts, marker='o', linewidth=2, markersize=8, color='#4ECDC4')
+            ax.fill_between(range(len(sorted_dates)), counts, alpha=0.3, color='#4ECDC4')
+            ax.set_xlabel('日期', fontsize=12)
+            ax.set_ylabel('问题数量', fontsize=12)
+            ax.set_title('学习活跃度趋势', fontsize=14, fontweight='bold', pad=20)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            buf.seek(0)
+            charts['trend_line'] = buf.getvalue()
+            plt.close()
+        
+        # 3. 知识点掌握情况柱状图
+        subject_scores = {}
+        for q in questions_data:
+            subject = q.get('subject', '综合')
+            score = q.get('score', None)
+            if score is not None:
+                if subject not in subject_scores:
+                    subject_scores[subject] = []
+                subject_scores[subject].append(score)
+        
+        if subject_scores:
+            subjects = list(subject_scores.keys())
+            avg_scores = [sum(scores)/len(scores) for scores in subject_scores.values()]
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            bars = ax.bar(subjects, avg_scores, color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8'][:len(subjects)])
+            ax.set_xlabel('学科', fontsize=12)
+            ax.set_ylabel('平均得分', fontsize=12)
+            ax.set_title('各学科掌握情况', fontsize=14, fontweight='bold', pad=20)
+            ax.set_ylim(0, 100)
+            
+            for bar, score in zip(bars, avg_scores):
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
+                       f'{score:.1f}', ha='center', va='bottom', fontsize=10)
+            
+            plt.tight_layout()
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            buf.seek(0)
+            charts['subject_bar'] = buf.getvalue()
+            plt.close()
+        
+        # 4. 学习时长分布直方图
+        study_times = [q.get('study_time', 0) for q in questions_data if q.get('study_time', 0) > 0]
+        if study_times:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.hist(study_times, bins=10, color='#45B7D1', edgecolor='black', alpha=0.7)
+            ax.set_xlabel('学习时长（分钟）', fontsize=12)
+            ax.set_ylabel('频次', fontsize=12)
+            ax.set_title('学习时长分布', fontsize=14, fontweight='bold', pad=20)
+            ax.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout()
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            buf.seek(0)
+            charts['time_hist'] = buf.getvalue()
+            plt.close()
+        
+    except Exception as e:
+        st.warning(f"⚠️ 图表生成失败：{str(e)}")
     
-    with st.chat_message("assistant"):
-        with st.spinner("处理中..."):
-            try:
-                client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
-                response = client.chat.completions.create(
-                    model="qwen-plus",
-                    messages=st.session_state.messages
-                )
-                
-                ai_response = response.choices[0].message.content
-                
-                # 显示 AI 回复
-                st.markdown(ai_response)
-                
-                # 检查是否包含链接或图片
-                if "http" in ai_response:
-                    import re
-                    urls = re.findall(r'http[s]?://\S+', ai_response)
-                    if urls:
-                        st.caption("📎 相关链接：")
-                        for url in urls:
-                            st.markdown(f"- {url}")
-                
-                # 提供下载按钮
-                if len(ai_response) > 100:
-                    file_name = f"AI_回复_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                    st.download_button(
-                        label="📥 下载 AI 回复为文本文件",
-                        data=ai_response,
-                        file_name=file_name,
-                        mime="text/plain",
-                        key=f"download_audio_{len(learning_data.get('questions', []))}"
-                    )
-                
-                st.session_state.messages.append({"role": "assistant", "content": ai_response})
-                
-                # 保存聊天记录（语音提问）
-                learning_data["questions"].append({
-                    "question": "[语音消息]",
-                    "answer": ai_response,  # 保存 AI 回答
-                    "scenario": scenario,
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "answered": True
-                })
-            except Exception as e:
-                st.error(f"请求失败：{str(e)}")
+    return charts
+
+
+def display_analysis_charts(charts):
+    """展示分析图表"""
+    if not charts:
+        return
+    
+    st.subheader("📊 AI 数据分析图表")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if 'scenario_pie' in charts:
+            st.image(charts['scenario_pie'], caption='互动场景分布', use_container_width=True)
+    
+    with col2:
+        if 'trend_line' in charts:
+            st.image(charts['trend_line'], caption='学习活跃度趋势', use_container_width=True)
+    
+    if 'subject_bar' in charts or 'time_hist' in charts:
+        cols = st.columns(2)
+        idx = 0
+        if 'subject_bar' in charts:
+            with cols[idx]:
+                st.image(charts['subject_bar'], caption='各学科掌握情况', use_container_width=True)
+            idx += 1
+        if 'time_hist' in charts:
+            with cols[idx]:
+                st.image(charts['time_hist'], caption='学习时长分布', use_container_width=True)
+
+
+# ==================== 主菜单逻辑 ====================
 
 # 主界面
 if menu == "智能答疑":
@@ -546,7 +514,7 @@ if menu == "智能答疑":
     # 聊天记录管理区域
     if st.session_state.learning_data.get("questions"):
         with st.expander(f"📝 聊天记录管理 ({len(st.session_state.learning_data['questions'])} 条)"):
-            col1, col2 = st.columns([3, 1])
+            col1, col2, col3 = st.columns([3, 1, 1])
             
             with col1:
                 st.subheader("🔍 搜索聊天记录")
@@ -564,15 +532,44 @@ if menu == "智能答疑":
                     key="export_format_select"
                 )
             
+            with col3:
+                st.subheader("💾 备份")
+                if st.button("💾 立即备份", use_container_width=True):
+                    analysis_service = AnalysisService()
+                    result = analysis_service.manage_learning_data("backup")
+                    if result["success"]:
+                        st.success("✅ 数据已备份")
+                    else:
+                        st.error(f"备份失败：{result.get('error')}")
+            
+            # 多轮对话控制
+            st.divider()
+            st.subheader("💬 多轮对话控制")
+            col_msg1, col_msg2 = st.columns([3, 1])
+            
+            with col_msg1:
+                msg_count = len(st.session_state.get("messages", [])) // 2  # 除以2因为每轮有用户和AI两条消息
+                st.caption(f"当前对话历史：{msg_count} 轮对话（{len(st.session_state.get('messages', []))} 条消息）")
+            
+            with col_msg2:
+                if st.button("🗑️ 清空对话历史", type="secondary", use_container_width=True, key="clear_chat_messages"):
+                    qa_service = QAService()
+                    result = qa_service.manage_chat_history("clear")
+                    if result["success"]:
+                        st.success("✅ 对话历史已清空")
+                        st.rerun()
+                    else:
+                        st.error(f"清空失败：{result.get('error')}")
+            
             # 搜索结果显示
             filtered_questions = st.session_state.learning_data["questions"]
             if search_keyword:
-                filtered_questions = [
-                    q for q in st.session_state.learning_data["questions"]
-                    if search_keyword.lower() in q['question'].lower() or 
-                       (q.get('answer') and search_keyword.lower() in q.get('answer', '').lower())
-                ]
-                st.caption(f"🔍 找到 {len(filtered_questions)} 条相关记录")
+                # 使用服务层搜索
+                analysis_service = AnalysisService()
+                result = analysis_service.manage_learning_data("search", keyword=search_keyword)
+                if result["success"]:
+                    filtered_questions = result["data"]
+                    st.caption(f"🔍 找到 {len(filtered_questions)} 条相关记录")
             
             # 显示所有问题列表
             question_options = []
@@ -590,7 +587,7 @@ if menu == "智能答疑":
                 
                 col1, col2, col3 = st.columns([1, 1, 2])
                 with col1:
-                    if st.button("🗑️ 删除选中记录", type="primary", use_container_width=True):
+                    if st.button("🗑️ 删除选中记录", type="primary", use_container_width=True, key="delete_learning_records_btn"):
                         if questions_to_delete:
                             # 获取要删除的索引
                             indices_to_delete = [int(q.split('.')[0]) - 1 for q in questions_to_delete]
@@ -604,47 +601,31 @@ if menu == "智能答疑":
                 
                 with col2:
                     if st.button("🗑️ 清空所有记录", use_container_width=True):
-                        st.session_state.learning_data["questions"] = []
-                        st.success("✅ 已清空所有聊天记录")
-                        st.rerun()
+                        analysis_service = AnalysisService()
+                        result = analysis_service.manage_learning_data("clear")
+                        if result["success"]:
+                            st.success("✅ 已清空所有聊天记录")
+                            st.rerun()
                 
                 with col3:
                     st.caption(f"当前共 {len(st.session_state.learning_data['questions'])} 条记录")
                 
                 # 导出功能
                 if st.button("📤 导出聊天记录", type="primary", use_container_width=True):
-                    import json
-                    from datetime import datetime
+                    analysis_service = AnalysisService()
+                    format_type = "json" if export_format == "JSON" else "txt"
+                    result = analysis_service.manage_learning_data("export", format=format_type)
                     
-                    if export_format == "TXT":
-                        # 导出为 TXT 文件
-                        export_content = ""
-                        for i, q in enumerate(st.session_state.learning_data["questions"], 1):
-                            export_content += f"第{i}条记录\n"
-                            export_content += f"时间：{q.get('time', '未知')}\n"
-                            export_content += f"场景：{q.get('scenario', '答疑')}\n"
-                            export_content += f"问题：{q.get('question', '')}\n"
-                            if q.get('answer'):
-                                export_content += f"答案：{q.get('answer', '')}\n"
-                            export_content += "-" * 50 + "\n"
+                    if result["success"] and result["data"]:
+                        file_name = generate_filename("聊天记录", export_format.lower())
+                        mime_type = "application/json" if export_format == "JSON" else "text/plain"
                         
-                        file_name = f"聊天记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                         st.download_button(
-                            label="📥 下载 TXT 格式",
-                            data=export_content.encode('utf-8'),
+                            label=f"📥 下载 {export_format} 格式",
+                            data=result["data"].encode('utf-8') if isinstance(result["data"], str) else result["data"],
                             file_name=file_name,
-                            mime="text/plain",
-                            key="download_txt_chat"
-                        )
-                    else:
-                        # 导出为 JSON 文件
-                        file_name = f"聊天记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                        st.download_button(
-                            label="📥 下载 JSON 格式",
-                            data=json.dumps(st.session_state.learning_data["questions"], ensure_ascii=False, indent=2).encode('utf-8'),
-                            file_name=file_name,
-                            mime="application/json",
-                            key="download_json_chat"
+                            mime=mime_type,
+                            key=f"download_{export_format.lower()}_chat"
                         )
     
     tab1, tab2, tab3 = st.tabs(["📖 课前预习", "🎯 课中互动", "📝 课后辅导"])
@@ -792,7 +773,7 @@ if menu == "智能答疑":
                         
                         col1, col2 = st.columns([1, 3])
                         with col1:
-                            if st.button("🗑️ 删除选中记录", type="primary", use_container_width=True):
+                            if st.button("🗑️ 删除选中记录", type="primary", use_container_width=True, key="delete_interaction_records_btn"):
                                 if interactions_to_delete:
                                     # 获取要删除的索引
                                     indices_to_delete = [int(q.split('.')[0]) - 1 for q in interactions_to_delete]
@@ -883,35 +864,19 @@ if menu == "智能答疑":
         if st.button("🤖 AI 解析课件内容", type="primary"):
             with st.spinner("正在解析课件内容..."):
                 try:
-                    client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
-                    
-                    # 构建文件信息
-                    file_list = "\n".join([f"- {file.name} ({file.size} bytes)" for file in uploaded_files])
-                    
-                    prompt = f"""你是一位专业的教学内容分析师。请分析以下上传的教学资料，提取关键信息。
-
-上传的文件列表：
-{file_list}
-
-请完成以下任务：
-1. 📚 **知识点提炼**（列出核心概念、重点难点）
-2. 🎯 **教学目标**（知识目标、能力目标、素养目标）
-3. 📝 **典型例题**（提供 3-5 道代表性题目及解析）
-4. 💡 **教学建议**（推荐的教学方法、活动设计）
-5. ⏰ **课时安排**（建议学习时长、进度规划）
-6. 🔗 **拓展资源**（相关知识点链接、延伸阅读材料）
-
-要求：结构清晰，语言专业，适合教师直接使用。"""
-                    
-                    response = client.chat.completions.create(
-                        model="moonshot-v1-8k",  # Kimi 模型
-                        messages=[{"role": "user", "content": prompt}]
+                    # 调用服务层解析文件
+                    courseware_service = CoursewareService()
+                    result = courseware_service.analyze_uploaded_files(
+                        uploaded_files=uploaded_files,
+                        api_key=DEFAULT_API_KEY,
+                        base_url=BASE_URL
                     )
                     
-                    analysis_result = response.choices[0].message.content
-                    
-                    st.success("✅ 课件解析完成！")
-                    st.markdown(analysis_result)
+                    if result["success"]:
+                        st.success("✅ 课件解析完成！")
+                        st.markdown(result["analysis"])
+                    else:
+                        st.error(f"❌ 解析失败：{result.get('error', '未知错误')}")
                     
                 except Exception as e:
                     st.error(f"解析失败：{str(e)}")
@@ -938,7 +903,6 @@ elif menu == "课件生成":
                         if selected and st.button("确认加载", type="primary"):
                             cw = courseware_options[selected]
                             # 解析 JSON 数据
-                            import json
                             cw_data = json.loads(cw['content'])
                             
                             # 恢复到 session_state
@@ -962,28 +926,18 @@ elif menu == "课件生成":
             else:
                 st.warning("数据库未连接，无法加载历史课件")
     
-    # 第一步：基本信息输入
+    # 基本信息输入
     st.subheader("📝 第一步：填写基本信息")
-    col1, col2 = st.columns(2)
-    with col1:
-        topic = st.text_input("课件主题", value=st.session_state.courseware_session.get("topic", ""), placeholder="例如：函数的单调性", key="topic_input")
-    with col2:
-        grade_level = st.text_input(
-            "年级",
-            value=st.session_state.courseware_session.get("grade_level", ""),
-            placeholder="例如：高一、八年级、大学一年级等",
-            key="grade_input"
-        )
+    topic = st.text_input("课件主题", value=st.session_state.courseware_session.get("topic", ""), placeholder="例如：函数的单调性", key="topic_input")
     
-    # 更新会话状态（科目由 AI 自动识别）
-    if topic or grade_level:
+    # 更新会话状态
+    if topic:
         st.session_state.courseware_session["topic"] = topic
-        st.session_state.courseware_session["grade_level"] = grade_level
     
-    # 第二步：上传参考资料
+    # 上传参考资料
     st.subheader("📎 第二步：上传参考资料（可选）")
-    reference_files = st.file_uploader("上传教学资料，AI 将基于资料生成课件",
-                                        type=["pdf", "doc", "docx", "ppt", "pptx", "txt"],
+    reference_files = st.file_uploader("上传教学资料（支持图片、PDF、Word 等）",
+                                        type=["pdf", "doc", "docx", "ppt", "pptx", "txt", "jpg", "jpeg", "png"],
                                         accept_multiple_files=True,
                                         key="courseware_upload")
     
@@ -991,7 +945,7 @@ elif menu == "课件生成":
         for file in reference_files:
             st.success(f"✅ {file.name}")
     
-    # 第三步：描述具体需求
+    # 描述具体需求
     st.subheader("💬 第三步：描述您的具体需求")
     st.caption("您可以告诉 AI 想要什么样的课件风格、重点内容、活动设计等")
     
@@ -1038,9 +992,93 @@ elif menu == "课件生成":
         
         st.rerun()
     
-    # 第四步：生成课件
+    # 智能澄清对话（在第三步和第四步之间）
+    st.divider()
+    st.subheader("💡 智能需求澄清")
+    st.caption("AI 将主动提问以更好地理解您的需求")
+    
+    # 初始化澄清对话
+    if "clarification_started" not in st.session_state:
+        st.session_state.clarification_started = False
+    
+    if "clarification_messages" not in st.session_state:
+        st.session_state.clarification_messages = []
+    
+    if not st.session_state.clarification_started and topic:
+        if st.button("🤖 开始智能澄清", type="secondary"):
+            st.session_state.clarification_started = True
+            
+            # 调用服务层开始澄清
+            courseware_service = CoursewareService()
+            result = courseware_service.start_clarification(
+                topic=topic,
+                api_key=DEFAULT_API_KEY,
+                base_url=BASE_URL
+            )
+            
+            if result["success"]:
+                st.session_state.clarification_messages.append({
+                    "role": "assistant",
+                    "content": result["question"]
+                })
+            else:
+                st.error(f"❌ 澄清失败：{result.get('error', '未知错误')}")
+            
+            st.rerun()
+    
+    # 显示澄清对话
+    if st.session_state.clarification_started:
+        for msg in st.session_state.clarification_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        
+        # 用户回复输入
+        user_reply = st.chat_input("请回答 AI 的问题...", key="clarification_input")
+        
+        if user_reply:
+            # 添加用户回复
+            st.session_state.clarification_messages.append({
+                "role": "user",
+                "content": user_reply
+            })
+            
+            # 调用服务层继续澄清
+            courseware_service = CoursewareService()
+            result = courseware_service.continue_clarification(
+                topic=topic,
+                conversation_history=st.session_state.clarification_messages,
+                api_key=DEFAULT_API_KEY,
+                base_url=BASE_URL
+            )
+            
+            if result["success"]:
+                st.session_state.clarification_messages.append({
+                    "role": "assistant",
+                    "content": result["response"]
+                })
+                
+                # 如果包含“需求已确认”，提取需求到 requirements
+                if result.get("confirmed"):
+                    st.session_state.courseware_session["requirements"].append(user_reply)
+                    st.success("✅ 需求已确认！现在可以点击“开始生成课件”按钮")
+            else:
+                st.error(f"❌ 澄清失败：{result.get('error', '未知错误')}")
+            
+            st.rerun()
+    
+    # 生成课件
     st.divider()
     st.subheader("🚀 第四步：生成课件")
+    
+    # 添加快速模式选项
+    col_speed, col_info = st.columns([1, 3])
+    with col_speed:
+        fast_mode = st.checkbox("⚡ 快速模式", value=True, help="启用后可提升 50-70% 的生成速度，但课件内容会更精简")
+    with col_info:
+        if fast_mode:
+            st.info("💨 快速模式已启用：8-10页幻灯片，无配图，简化装饰")
+        else:
+            st.info("🎨 标准模式：10-15页幻灯片，含配图和精美装饰（生成较慢）")
     
     col1, col2 = st.columns([1, 3])
     with col1:
@@ -1061,166 +1099,92 @@ elif menu == "课件生成":
             st.rerun()
     
     if generate_btn and topic:
-        with st.status("正在生成课件...", expanded=True) as status:
+        mode_text = "快速模式" if fast_mode else "标准模式"
+        with st.status(f"正在生成课件（{mode_text}）...", expanded=True) as status:
             try:
-                # 处理上传的文件内容
-                file_content = ""
-                if reference_files:
-                    status.write("正在读取上传的资料...")
-                    for file in reference_files:
-                        try:
-                            if file.type == "application/pdf":
-                                file_content += f"\n【{file.name}】\n"
-                                file_content += "(PDF 文件内容，建议使用 OCR 或 PDF 解析库)"
-                            elif file.type in ["text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-                                file_content += f"\n【{file.name}】\n"
-                                file_content += file.read().decode('utf-8')[:3000]
-                        except Exception as e:
-                            st.warning(f"读取文件 {file.name} 失败：{str(e)}")
-                
                 # 构建完整的需求描述
                 requirements_text = "\n".join(st.session_state.courseware_session["requirements"]) if st.session_state.courseware_session.get("requirements") else "无特殊要求"
                 
-                # 调用 AI 识别科目并生成课件大纲
-                client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
+                status.update(label=f"⏳ 步骤 1/3: 识别学科并生成大纲（{mode_text}）...")
                 
-                # 第一步：查询 RAG 知识库，获取相关资料
-                rag_context = ""
-                rag_docs_found = []
+                # 调用服务层生成课件
+                courseware_service = CoursewareService()
+                result = courseware_service.generate_courseware(
+                    topic=topic,
+                    requirements_text=requirements_text,
+                    api_key=DEFAULT_API_KEY,
+                    base_url=BASE_URL,
+                    fast_mode=fast_mode  # 传递快速模式参数
+                )
                 
-                if st.session_state.rag_kb_connected:
-                    try:
-                        status.write("🔍 正在知识库中检索相关教学资料...")
-                        rag_results = rag_kb.search_documents(topic, limit=5)
-                        
-                        if rag_results:
-                            rag_context = "\n\n=== 知识库参考资料 ===\n\n"
-                            for i, doc in enumerate(rag_results[:3], 1):
-                                title = doc.get('title', '未知文档')
-                                subject = doc.get('subject', '未知学科')
-                                content = doc.get('content_text', '')[:1500]  # 每篇文档取前1500字
-                                rag_docs_found.append({"title": title, "subject": subject})
-                                
-                                rag_context += f"📚 参考资料 {i}:《{title}》({subject})\n"
-                                rag_context += f"{content}\n\n"
-                                
-                                # 更新使用次数
-                                rag_kb.update_document_usage(doc['id'])
-                            
-                            rag_context += "=== 参考资料结束 ===\n\n"
-                            status.write(f"✅ 找到 {len(rag_docs_found)} 篇相关教学资料")
-                    except Exception as rag_error:
-                        pass  # RAG 检索失败，静默处理
-                
-                # 第二步：构建提示词（带知识库上下文）
-                if rag_context:
-                    identify_prompt = f"""请根据主题'{topic}'和年级'{grade_level}'，自动识别该课程所属的学科（如：数学、物理、语文等），并为该课程设计一个课件。
-
-以下是从知识库中检索到的相关教学资料，请优先参考这些内容：
-{rag_context}
-
-具体要求：
-{requirements_text}
-
-请提供：1.学科名称 2.教学目标 3.重点难点 4.知识点列表 5.典型例题 6.教学活动设计"""
+                if result["success"]:
+                    status.update(label=f"✅ 步骤 2/3: 生成 PPT 结构完成")
+                    
+                    # 更新 session_state
+                    st.session_state.courseware_session["subject"] = result["subject"]
+                    st.session_state.courseware_session["outline"] = result["outline"]
+                    st.session_state.courseware_session["ppt_content"] = result["slides"]
+                    st.session_state.courseware_session["ppt_theme"] = result["theme"]
+                    st.session_state.courseware_session["generated"] = True
+                    st.session_state.courseware_session["creation_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.courseware_session["last_modified"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.courseware_session["db_id"] = result.get("courseware_id")
+                    
+                    # 保存生成的图片和动画（如果有）
+                    if result.get("generated_images"):
+                        st.session_state.courseware_session["generated_images"] = result["generated_images"]
+                    
+                    status.update(label=f"✅ 步骤 3/3: 保存到数据库完成")
+                    status.update(label="✅ 课件生成完成!", state="complete")
+                    st.success(f"✅ 学科识别：{result['subject']}")
+                    st.success(f"✅ 幻灯片数：{len(result['slides'])}")
+                    if result.get("generated_images"):
+                        st.success(f"✅ 生成配图：{len(result['generated_images'])} 张")
+                    else:
+                        st.info("💨 快速模式：已跳过图片生成以提升速度")
                 else:
-                    identify_prompt = f"请根据主题'{topic}'和年级'{grade_level}'，自动识别该课程所属的学科（如：数学、物理、语文等），并为该课程设计一个课件。\n\n具体要求：\n{requirements_text}\n\n请提供：1.学科名称 2.教学目标 3.重点难点 4.知识点列表 5.典型例题 6.教学活动设计"
-                
-                response = client.chat.completions.create(
-                    model="moonshot-v1-8k",
-                    messages=[{"role": "user", "content": identify_prompt}]
-                )
-                
-                outline = response.choices[0].message.content
-                st.session_state.courseware_session["outline"] = outline
-                
-                # 尝试从 AI 回复中提取学科（简单处理，也可以让 AI 输出 JSON）
-                subject = "综合" # 默认值
-                if "学科：" in outline or "学科:" in outline:
-                    subject_line = [line for line in outline.split('\n') if '学科' in line][0]
-                    subject = subject_line.split('：')[-1].split(':')[-1].strip()
-                
-                st.session_state.courseware_session["subject"] = subject
-                
-                st.write(f"✅ 教学需求分析完成 (AI 识别学科: {subject})")
-                if rag_docs_found:
-                    st.caption(f"📚 参考了 {len(rag_docs_found)} 篇教学资料")
-                time.sleep(0.5)
-                st.write("✅ 知识点匹配完成")
-                time.sleep(0.5)
-                
-                # 让 AI 生成 PPT 内容结构
-                status.write("正在生成 PPT 课件...")
-                ppt_prompt = f"""你是一位专业的 PPT 课件设计师。请为{grade_level}{subject}课程'{topic}'设计一个完整的 PPT 课件。
-
-要求：
-1. 总共 10-15 页幻灯片
-2. 包含：封面、目录、教学目标、重点难点、知识点讲解（分多页）、典型例题、课堂小结、课后作业
-3. 每页包含明确的标题和 3-5 个要点
-4. 结合以下用户需求：{requirements_text}
-
-请严格按照以下 JSON 格式输出（不要添加任何其他说明）：
-{{
-    "slides": [
-        {{
-            "title": "页面标题",
-            "subtitle": "副标题或说明",
-            "content": ["要点 1", "要点 2", "要点 3"]
-        }}
-    ]
-}}
-
-注意：只输出 JSON，不要有任何其他文字。"""
-                
-                ppt_response = client.chat.completions.create(
-                    model="moonshot-v1-8k",
-                    messages=[{"role": "user", "content": ppt_prompt}]
-                )
-                
-                import json
-                ppt_json = json.loads(ppt_response.choices[0].message.content)
-                slides = ppt_json.get("slides", [])
-                st.session_state.courseware_session["ppt_content"] = slides
-                st.session_state.courseware_session["generated"] = True
-                
-                # ✅ 保存课件到数据库（实现持久化）
-                if st.session_state.db_connected:
-                    try:
-                        courseware_data = {
-                            "title": topic,
-                            "subject": subject,
-                            "grade_level": grade_level,
-                            "outline": outline,
-                            "slides": slides,
-                            "requirements": st.session_state.courseware_session.get("requirements", []),
-                            "reference_files": [f.name for f in reference_files] if reference_files else [],
-                            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "version": "1.0"
-                        }
-                        
-                        courseware_id = db.add_courseware(
-                            title=topic,
-                            subject=subject,
-                            grade_level=grade_level,
-                            content=json.dumps(courseware_data, ensure_ascii=False),
-                            created_by=1  # 默认用户 ID
-                        )
-                        
-                        if courseware_id:
-                            info(f"✅ 课件已保存到数据库：{topic} (ID: {courseware_id})")
-                            st.session_state.courseware_session["db_id"] = courseware_id
-                    except Exception as db_error:
-                        warning(f"⚠️ 课件保存到数据库失败：{str(db_error)}")
-                
-                status.update(label="✅ 课件生成完成!", state="complete")
+                    st.error(f"❌ 生成失败：{result.get('error', '未知错误')}")
+                    status.update(label="❌ 生成失败", state="error")
                     
             except Exception as e:
-                st.error(f"生成失败：{str(e)}")
+                error_msg = str(e)
+                st.error(f"❌ 生成失败：{error_msg}")
+                status.update(label="❌ 生成失败", state="error")
+                
+                # 提供更详细的错误提示和解决方案
+                if "连接错误" in error_msg or "connection" in error_msg.lower():
+                    st.warning("🔧 可能的原因和解决方案：")
+                    st.info("1️⃣ 网络连接不稳定 - 请检查您的网络")
+                    st.info("2️⃣ API Key 无效或已过期 - 请检查 .env 文件中的 KIMI_API_KEY")
+                    st.info("3️⃣ Kimi API 服务暂时不可用 - 请稍后重试")
+                    st.info("4️⃣ 请求超时 - 已增加超时时间，如仍失败请稍后重试")
+                elif "timeout" in error_msg.lower():
+                    st.warning("⏰ 请求超时：AI 服务响应时间过长")
+                    st.info("💡 建议：请稍后重试，或简化您的要求")
+                elif "JSON" in error_msg or "json" in error_msg.lower():
+                    st.warning("📄 AI 返回的数据格式有误")
+                    st.info("💡 建议：请重新生成，AI 会自动调整格式")
+                else:
+                    st.info("💡 建议：请检查错误信息，稍后重试。如问题持续存在，请联系管理员。")
 
-# 显示已生成的课件内容（在 if generate_btn 块外，保持显示）
-if st.session_state.courseware_session.get("generated") and st.session_state.courseware_session.get("outline"):
+# ✅ 显示已生成的课件内容（仅在“课件生成”页面显示）
+if menu == "课件生成" and st.session_state.courseware_session.get("generated") and st.session_state.courseware_session.get("outline"):
     st.divider()
     st.subheader("📊 已生成的课件")
+    
+    # 显示课件元信息
+    creation_time = st.session_state.courseware_session.get("creation_time", "未知")
+    last_modified = st.session_state.courseware_session.get("last_modified", "未知")
+    topic = st.session_state.courseware_session.get("topic", "未命名课件")
+    subject = st.session_state.courseware_session.get("subject", "综合")
+    
+    col_meta1, col_meta2 = st.columns(2)
+    with col_meta1:
+        st.info(f"📚 主题：{topic}")
+    with col_meta2:
+        st.info(f"🎓 学科：{subject}")
+    
+    st.info(f"⏰ 创建时间：{creation_time}")
     
     outline = st.session_state.courseware_session["outline"]
     slides = st.session_state.courseware_session.get("ppt_content", [])
@@ -1242,61 +1206,633 @@ if st.session_state.courseware_session.get("generated") and st.session_state.cou
     # 展示每一页幻灯片
     for i, slide in enumerate(slides):
         with st.expander(f"📄 第 {i+1} 页：{slide.get('title', '无标题')}", expanded=(i==0)):
-            if slide.get('subtitle'):
-                st.caption(slide.get('subtitle'))
+            subtitle = slide.get('subtitle', '')
+            if subtitle and subtitle.strip():
+                st.caption(subtitle)
             content = slide.get('content', [])
-            for point in content:
-                st.write(f"• {point}")
+            # 过滤空字符串，只展示有效内容
+            valid_content = [point for point in content if point and point.strip()]
+            if valid_content:
+                for point in valid_content:
+                    st.write(f"• {point}")
+            else:
+                st.info("暂无内容")
+    
+    # 可视化 PPT 预览界面（模拟真实 PPT 软件界面）
+    st.divider()
+    st.subheader("🖼️ PPT 课件预览")
+    
+    # 获取主题颜色
+    theme = st.session_state.courseware_session.get('ppt_theme', {})
+    primary_color = theme.get('primary_color', '#0a192f')
+    secondary_color = theme.get('secondary_color', '#64ffda')
+    bg_color = theme.get('bg_color', '#ffffff')
+    text_color = theme.get('text_color', '#333333')
+    template_style = theme.get('template_style', 'tech')
+    
+    # 使用 tabs 分页显示所有幻灯片
+    slide_tabs = st.tabs([f"第 {i+1} 页" for i in range(len(slides))])
+    
+    for idx, (tab, slide) in enumerate(zip(slide_tabs, slides)):
+        with tab:
+            slide_title = slide.get('title', '无标题')
+            subtitle = slide.get('subtitle', '')
+            content = slide.get('content', [])
+            valid_content = [point for point in content if point and point.strip()]
+            
+            # 根据模板风格调整样式
+            if template_style == 'tech':
+                gradient = f'linear-gradient(135deg, {primary_color} 0%, #1a3a5c 100%)'
+                shadow = '0 8px 32px rgba(10, 25, 47, 0.3)'
+            elif template_style == 'edu':
+                gradient = f'linear-gradient(135deg, {primary_color} 0%, #7b4fa2 100%)'
+                shadow = '0 8px 32px rgba(91, 44, 111, 0.3)'
+            elif template_style == 'nature':
+                gradient = f'linear-gradient(135deg, {primary_color} 0%, #2ecc71 100%)'
+                shadow = '0 8px 32px rgba(39, 174, 96, 0.3)'
+            else:
+                gradient = f'linear-gradient(135deg, {primary_color} 0%, #34495e 100%)'
+                shadow = '0 8px 32px rgba(44, 62, 80, 0.3)'
+            
+            # 构建 HTML 内容列表
+            content_html = ""
+            if valid_content:
+                for point in valid_content:
+                    content_html += f"<li style='margin-bottom: 18px; font-size: 20px; line-height: 1.8; color: {text_color};'>• {point}</li>"
+            else:
+                content_html = "<p style='color: #999; font-size: 18px;'>📝 此页暂无详细内容</p>"
+            
+            # 副标题 HTML
+            subtitle_html = ""
+            if subtitle and subtitle.strip():
+                subtitle_html = f"<p style='color: #666; font-size: 18px; margin: 10px 0 30px 0;'>{subtitle}</p>"
+            
+            # 构建完整的 HTML 字符串
+            full_html = f"""
+            <div style='margin: 20px 0;'>
+                <div style='background: #e8e8e8; padding: 30px; border-radius: 12px; box-shadow: {shadow};'>
+                    <div style='background: white; border-radius: 8px; aspect-ratio: 16/9; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1);'>
+                        <!-- PPT 标题栏 -->
+                        <div style='background: {gradient}; padding: 40px 50px 30px 50px; position: relative; min-height: 120px;'>
+                            <!-- 装饰元素 -->
+                            <div style='position: absolute; top: 0; right: 0; width: 200px; height: 100%; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1));'></div>
+                            <div style='position: absolute; bottom: 0; left: 0; right: 0; height: 5px; background: {secondary_color};'></div>
+                            
+                            <!-- 标题 -->
+                            <h1 style='color: white; margin: 0; font-size: 42px; font-weight: bold; text-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>{slide_title}</h1>
+                        </div>
+                        
+                        <!-- PPT 内容区 -->
+                        <div style='flex: 1; padding: 40px 50px; background: {bg_color}; overflow-y: auto;'>
+                            {subtitle_html}
+                            <ul style='padding-left: 30px; margin: 0;'>
+                                {content_html}
+                            </ul>
+                        </div>
+                        
+                        <!-- PPT 页脚 -->
+                        <div style='background: #f5f5f5; padding: 12px 50px; border-top: 2px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center;'>
+                            <span style='color: #999; font-size: 14px;'>AI 课件生成系统</span>
+                            <span style='color: #999; font-size: 14px;'>第 {idx+1} / {len(slides)} 页</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
+            
+            # 使用 components.v1.html 渲染 HTML（比 markdown 更可靠）
+            st.components.v1.html(full_html, height=500)
+    
+    # 修改意见反馈功能
+    st.divider()
+    st.subheader("💬 提出修改意见")
+    
+    feedback = st.text_area(
+        "请输入您的修改建议（如：调整顺序、简化某页、增加一个案例等）",
+        placeholder="例如：第3页内容太多，需要简化；希望能增加更多互动环节...",
+        height=100,
+        key="ppt_feedback"
+    )
+    
+    col_feedback1, col_feedback2 = st.columns([1, 3])
+    with col_feedback1:
+        if st.button("🔄 基于反馈重新生成", type="primary"):
+            if feedback:
+                with st.spinner("正在根据您的反馈重新生成课件..."):
+                    try:
+                        # 调用服务层调整课件
+                        courseware_service = CoursewareService()
+                        result = courseware_service.refine_courseware(
+                            feedback=feedback,
+                            topic=st.session_state.courseware_session.get('topic', ''),
+                            subject=st.session_state.courseware_session.get('subject', ''),
+                            slides=slides,
+                            api_key=DEFAULT_API_KEY,
+                            base_url=BASE_URL
+                        )
+                        
+                        if result["success"] and result.get("slides"):
+                            st.session_state.courseware_session["ppt_content"] = result["slides"]
+                            st.session_state.courseware_session["ppt_theme"] = result.get("theme", {})
+                            st.success("✅ 课件已根据您的反馈重新生成！")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ 重新生成失败：{result.get('error', '未知错误')}")
+                    except Exception as e:
+                        st.error(f"❌ 重新生成失败：{str(e)}")
+            else:
+                st.warning("⚠️ 请先输入修改建议")
+    
+    # 动画展示区域
+    if st.session_state.courseware_session.get("animations"):
+        animations = st.session_state.courseware_session.get("animations", [])
+        if animations and len(animations) > 0:
+            st.divider()
+            st.subheader("🎬 教学动画")
+            st.caption("AI 生成的配套教学动画，支持 GIF 和 HTML5 格式")
+            
+            for i, anim in enumerate(animations):
+                with st.expander(f"🎬 动画 {i+1}: {anim.get('title', '未命名')}", expanded=True):
+                    st.caption(anim.get('description', ''))
+                    
+                    # 显示 SVG 预览
+                    svg_code = anim.get('svg_code', '')
+                    if svg_code:
+                        try:
+                            st.components.v1.html(svg_code, height=350, scrolling=True)
+                        except Exception as e:
+                            st.warning(f"SVG 预览失败：{str(e)}")
+                    
+                    st.divider()
+                    col_anim1, col_anim2, col_anim3 = st.columns(3)
+                    
+                    with col_anim1:
+                        if st.button(f"💾 下载 HTML", key=f"html_{i}", use_container_width=True):
+                            animation_service = AnimationService()
+                            html_content = animation_service.generate_html_animation(
+                                svg_code, 
+                                anim.get('title', '教学动画')
+                            )
+                            st.download_button(
+                                label="下载 HTML 动画文件",
+                                data=html_content,
+                                file_name=f"{anim.get('title', 'animation')}.html",
+                                mime="text/html",
+                                key=f"download_html_{i}"
+                            )
+                    
+                    with col_anim2:
+                        if st.button(f"🎞️ 生成 GIF", key=f"gif_{i}", use_container_width=True):
+                            with st.spinner("正在生成 GIF（可能需要 10-20 秒）..."):
+                                try:
+                                    animation_service = AnimationService()
+                                    gif_path = animation_service.svg_to_gif(svg_code, f"animation_{i}.gif")
+                                    if gif_path and os.path.exists(gif_path):
+                                        with open(gif_path, "rb") as f:
+                                            st.download_button(
+                                                label="下载 GIF 动画",
+                                                data=f.read(),
+                                                file_name=f"{anim.get('title', 'animation')}.gif",
+                                                mime="image/gif",
+                                                key=f"download_gif_{i}"
+                                            )
+                                        # 删除临时文件
+                                        try:
+                                            os.remove(gif_path)
+                                        except:
+                                            pass
+                                    else:
+                                        st.error("❌ GIF 生成失败，请使用 HTML 版本")
+                                except Exception as e:
+                                    st.error(f"❌ GIF 生成失败：{str(e)}")
+                    
+                    with col_anim3:
+                        st.info(f"关联页面：第 {anim.get('related_slide_index', '?')} 页")
+                        st.caption(f"类型：{anim.get('animation_type', 'general')}")
+            
+            st.success("✅ 所有动画已生成，可以下载 HTML 或 GIF 文件集成到 PPT 中")
     
     # 使用 Kimi 生成的 JSON 数据创建真实的 PPT 文件
     from pptx import Presentation
-    from pptx.util import Pt
+    from pptx.util import Pt, Inches
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.enum.shapes import MSO_SHAPE
     import io
+    
+    def hex_to_rgb(hex_color):
+        """将十六进制颜色转换为 RGB 元组"""
+        hex_color = hex_color.lstrip('#')
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+    
+    def apply_background(slide, bg_type, colors):
+        """应用背景颜色"""
+        try:
+            if bg_type == 'gradient' and len(colors) >= 2:
+                # 使用第一种颜色作为背景
+                bg_color = hex_to_rgb(colors[0])
+                slide.background.fill.solid()
+                slide.background.fill.fore_color.rgb = RGBColor(*bg_color)
+            elif bg_type == 'solid' and len(colors) >= 1:
+                bg_color = hex_to_rgb(colors[0])
+                slide.background.fill.solid()
+                slide.background.fill.fore_color.rgb = RGBColor(*bg_color)
+            else:
+                # 默认白色背景
+                slide.background.fill.solid()
+                slide.background.fill.fore_color.rgb = RGBColor(255, 255, 255)
+        except:
+            # 如果失败，使用默认白色背景
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = RGBColor(255, 255, 255)
+    
+    def add_decorative_shape(slide, shape_type, left, top, width, height, fill_color):
+        """添加装饰性形状"""
+        try:
+            shape = slide.shapes.add_shape(shape_type, left, top, width, height)
+            shape.fill.solid()
+            shape.fill.fore_color.rgb = RGBColor(*hex_to_rgb(fill_color))
+            shape.line.fill.background()
+            return shape
+        except:
+            return None
     
     try:
         prs = Presentation()
+        # 设置幻灯片大小为 16:9 宽屏
+        prs.slide_width = Inches(13.333)
+        prs.slide_height = Inches(7.5)
+        
+        # 获取模板风格
+        template_style = st.session_state.courseware_session.get('template_style', 'tech')
+        theme = st.session_state.courseware_session.get('ppt_theme', {})
+        primary_color = theme.get('primary_color', '#0a192f')
+        secondary_color = theme.get('secondary_color', '#64ffda')
+        accent_color = theme.get('accent_color', '#00d4ff')
+        bg_color = theme.get('bg_color', '#0a192f')
+        text_color = theme.get('text_color', '#ffffff')
         font_name = 'Microsoft YaHei'
         
-        for i, slide_data in enumerate(slides):
-            if i == 0:
-                slide_layout = prs.slide_layouts[0]
-            else:
-                slide_layout = prs.slide_layouts[1]
-            
-            slide = prs.slides.add_slide(slide_layout)
-            
-            title = slide_data.get('title', '')
-            if slide.shapes.title:
-                slide.shapes.title.text = title
-                for paragraph in slide.shapes.title.text_frame.paragraphs:
-                    for run in paragraph.runs:
-                        run.font.name = font_name
-                        run.font.size = Pt(32)
-                        run.font.bold = True
-            
-            subtitle = slide_data.get('subtitle')
-            if subtitle and len(slide.placeholders) > 1:
-                subtitle_placeholder = slide.placeholders[1]
-                tf = subtitle_placeholder.text_frame
-                p = tf.paragraphs[0]
-                p.text = subtitle
-                for run in p.runs:
-                    run.font.name = font_name
-                    run.font.size = Pt(18)
-            
-            if len(slide.placeholders) > 1 and slide_data.get('content'):
-                content_placeholder = slide.placeholders[1]
-                tf = content_placeholder.text_frame
-                tf.clear()
+        def add_circle_decoration(slide, left, top, diameter, fill_color, opacity=0.3):
+            """添加圆形装饰"""
+            try:
+                shape = slide.shapes.add_shape(MSO_SHAPE.OVAL, left, top, diameter, diameter)
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = RGBColor(*hex_to_rgb(fill_color))
+                shape.fill.transparency = opacity
+                shape.line.fill.background()
+                return shape
+            except:
+                return None
+        
+        def add_line_decoration(slide, left, top, width, height, line_color, thickness=3):
+            """添加线条装饰"""
+            try:
+                shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = RGBColor(*hex_to_rgb(line_color))
+                shape.line.fill.background()
+                return shape
+            except:
+                return None
+        
+        def add_triangle_decoration(slide, left, top, width, height, fill_color):
+            """添加三角形装饰"""
+            try:
+                shape = slide.shapes.add_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, left, top, width, height)
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = RGBColor(*hex_to_rgb(fill_color))
+                shape.fill.transparency = 0.7
+                shape.line.fill.background()
+                return shape
+            except:
+                return None
+        
+        def add_glow_effect(slide, shape, glow_color, glow_size=10):
+            """为形状添加发光效果（通过添加半透明圆环模拟）"""
+            try:
+                left = shape.left - Pt(glow_size)
+                top = shape.top - Pt(glow_size)
+                width = shape.width + Pt(glow_size * 2)
+                height = shape.height + Pt(glow_size * 2)
+                glow = slide.shapes.add_shape(MSO_SHAPE.OVAL, left, top, width, height)
+                glow.fill.solid()
+                glow.fill.fore_color.rgb = RGBColor(*hex_to_rgb(glow_color))
+                glow.fill.transparency = 0.8
+                glow.line.fill.background()
+                return glow
+            except:
+                return None
+        
+        def add_cover_decorations(slide, style):
+            """为封面页添加装饰元素"""
+            if style == 'tech':
+                # 科技风格：圆形装饰 + 线条
+                add_circle_decoration(slide, Inches(9), Inches(0.5), Inches(3), primary_color, 0.5)
+                add_circle_decoration(slide, Inches(10), Inches(1.5), Inches(2), secondary_color, 0.3)
+                add_line_decoration(slide, Inches(0), Inches(6.8), Inches(13.333), Inches(0.1), accent_color)
+                add_line_decoration(slide, Inches(1), Inches(7), Inches(5), Inches(0.05), secondary_color)
                 
-                for j, point in enumerate(slide_data['content']):
-                    p = tf.add_paragraph() if j > 0 else tf.paragraphs[0]
-                    p.text = point
-                    p.level = 0
-                    p.space_after = Pt(10)
-                    for run in p.runs:
-                        run.font.name = font_name
-                        run.font.size = Pt(18)
+            elif style == 'edu':
+                # 教育风格：书本装饰
+                add_circle_decoration(slide, Inches(0.5), Inches(5), Inches(2), accent_color, 0.2)
+                add_circle_decoration(slide, Inches(11), Inches(0.5), Inches(1.5), primary_color, 0.3)
+                add_line_decoration(slide, Inches(0), Inches(7.3), Inches(13.333), Inches(0.2), primary_color)
+                
+            elif style == 'nature':
+                # 自然风格：圆点装饰
+                add_circle_decoration(slide, Inches(10), Inches(1), Inches(1.5), secondary_color, 0.4)
+                add_circle_decoration(slide, Inches(11.5), Inches(2), Inches(1), accent_color, 0.3)
+                add_circle_decoration(slide, Inches(0.5), Inches(6), Inches(2), primary_color, 0.2)
+                
+            elif style == 'minimal':
+                # 简约风格：几何线条
+                add_line_decoration(slide, Inches(0), Inches(3.5), Inches(13.333), Inches(0.05), secondary_color)
+                add_line_decoration(slide, Inches(6.5), Inches(0), Inches(0.05), Inches(7.5), accent_color)
+                
+            elif style == 'business':
+                # 商务风格：金色装饰
+                add_line_decoration(slide, Inches(0), Inches(7.2), Inches(13.333), Inches(0.3), accent_color)
+                add_circle_decoration(slide, Inches(10.5), Inches(0.5), Inches(2), accent_color, 0.2)
+        
+        def add_content_decorations(slide, style, slide_index):
+            """为内容页添加装饰元素"""
+            if style == 'tech':
+                # 侧边装饰线
+                add_line_decoration(slide, Inches(0), Inches(0), Inches(0.15), Inches(7.5), secondary_color)
+                # 底部装饰
+                add_line_decoration(slide, Inches(0), Inches(7.3), Inches(13.333), Inches(0.1), primary_color)
+                
+            elif style == 'edu':
+                # 顶部装饰条
+                add_line_decoration(slide, Inches(0), Inches(1.1), Inches(13.333), Inches(0.1), accent_color)
+                # 页码装饰
+                add_circle_decoration(slide, Inches(12.3), Inches(6.8), Inches(0.6), primary_color, 0.3)
+                
+            elif style == 'nature':
+                # 左侧装饰
+                add_line_decoration(slide, Inches(0), Inches(0), Inches(0.1), Inches(7.5), secondary_color)
+                
+            elif style == 'minimal':
+                # 极简边框
+                add_line_decoration(slide, Inches(0.3), Inches(1.3), Inches(12.7), Inches(0.03), RGBColor(200, 200, 200))
+                
+            elif style == 'business':
+                # 顶部金色装饰
+                add_line_decoration(slide, Inches(0), Inches(1.1), Inches(13.333), Inches(0.15), accent_color)
+                # 底部装饰
+                add_line_decoration(slide, Inches(0), Inches(7.3), Inches(13.333), Inches(0.1), primary_color)
+        
+        for i, slide_data in enumerate(slides):
+            # 根据布局类型选择版式
+            layout_type = slide_data.get('layout', 'title_content')
+            
+            if i == 0:  # 封面页 - 精美设计
+                slide_layout = prs.slide_layouts[6]  # 空白版式
+                slide = prs.slides.add_slide(slide_layout)
+                
+                # 应用深色渐变背景
+                bg_info = slide_data.get('background', {})
+                apply_background(slide, 'dark_gradient', [primary_color, bg_color])
+                
+                # 添加模板风格装饰
+                add_cover_decorations(slide, template_style)
+                
+                # 添加发光装饰圆（科技风格）
+                if template_style == 'tech':
+                    add_circle_decoration(slide, Inches(2), Inches(1), Inches(4), secondary_color, 0.15)
+                    add_circle_decoration(slide, Inches(8), Inches(4), Inches(3), accent_color, 0.2)
+                
+                # 添加大标题（超大字体，居中）
+                title = slide_data.get('title', '')
+                title_box = slide.shapes.add_textbox(Inches(0.5), Inches(2), Inches(12.333), Inches(2))
+                tf = title_box.text_frame
+                p = tf.paragraphs[0]
+                p.text = title
+                p.alignment = PP_ALIGN.CENTER
+                p.font.name = font_name
+                p.font.size = Pt(54)
+                p.font.bold = True
+                p.font.color.rgb = RGBColor(255, 255, 255)
+                
+                # 添加装饰线（标题下方）
+                add_line_decoration(slide, Inches(4), Inches(4.2), Inches(5.333), Inches(0.08), accent_color)
+                
+                # 添加副标题
+                subtitle = slide_data.get('subtitle', '')
+                if subtitle:
+                    subtitle_box = slide.shapes.add_textbox(Inches(1), Inches(4.5), Inches(11.333), Inches(1))
+                    tf = subtitle_box.text_frame
+                    p = tf.paragraphs[0]
+                    p.text = subtitle
+                    p.alignment = PP_ALIGN.CENTER
+                    p.font.name = font_name
+                    p.font.size = Pt(22)
+                    p.font.color.rgb = RGBColor(200, 220, 255)
+                
+                # 添加负责人/作者信息
+                author = slide_data.get('author', '')
+                if author:
+                    author_box = slide.shapes.add_textbox(Inches(4), Inches(5.8), Inches(5.333), Inches(0.6))
+                    tf = author_box.text_frame
+                    p = tf.paragraphs[0]
+                    p.text = f"主讲人：{author}"
+                    p.alignment = PP_ALIGN.CENTER
+                    p.font.name = font_name
+                    p.font.size = Pt(16)
+                    p.font.color.rgb = RGBColor(180, 200, 230)
+                
+            elif layout_type == 'section_divider':  # 章节过渡页
+                slide_layout = prs.slide_layouts[6]
+                slide = prs.slides.add_slide(slide_layout)
+                
+                # 全背景色
+                apply_background(slide, 'solid', [primary_color])
+                
+                # 添加装饰
+                add_circle_decoration(slide, Inches(10), Inches(0.5), Inches(2.5), accent_color, 0.2)
+                add_line_decoration(slide, Inches(0), Inches(7.2), Inches(13.333), Inches(0.15), secondary_color)
+                
+                # 居中大标题
+                title = slide_data.get('title', '')
+                title_box = slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(11.333), Inches(2))
+                tf = title_box.text_frame
+                p = tf.paragraphs[0]
+                p.text = title
+                p.alignment = PP_ALIGN.CENTER
+                p.font.name = font_name
+                p.font.size = Pt(48)
+                p.font.bold = True
+                p.font.color.rgb = RGBColor(255, 255, 255)
+                
+            else:  # 内容页 - 精美设计
+                slide_layout = prs.slide_layouts[6]  # 空白版式
+                slide = prs.slides.add_slide(slide_layout)
+                
+                # 应用浅色背景
+                apply_background(slide, 'solid', ['#ffffff'])
+                
+                # 添加模板风格装饰
+                add_content_decorations(slide, template_style, i)
+                
+                # 添加顶部标题栏（带渐变效果）
+                header_bar = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE,
+                    Inches(0), Inches(0), Inches(13.333), Inches(1.3)
+                )
+                header_bar.fill.solid()
+                header_bar.fill.fore_color.rgb = RGBColor(*hex_to_rgb(primary_color))
+                header_bar.line.fill.background()
+                
+                # 标题栏底部装饰线
+                add_line_decoration(slide, Inches(0), Inches(1.25), Inches(13.333), Inches(0.08), accent_color)
+                
+                # 添加标题
+                title = slide_data.get('title', '')
+                title_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.25), Inches(12), Inches(0.8))
+                tf = title_box.text_frame
+                p = tf.paragraphs[0]
+                p.text = title
+                p.font.name = font_name
+                p.font.size = Pt(26)
+                p.font.bold = True
+                p.font.color.rgb = RGBColor(255, 255, 255)
+                
+                # 添加页码（右下角）
+                page_num_box = slide.shapes.add_textbox(Inches(11.8), Inches(6.8), Inches(1), Inches(0.5))
+                tf = page_num_box.text_frame
+                p = tf.paragraphs[0]
+                p.text = f"{i + 1}"
+                p.alignment = PP_ALIGN.RIGHT
+                p.font.name = font_name
+                p.font.size = Pt(12)
+                p.font.color.rgb = RGBColor(150, 150, 150)
+                
+                # 添加内容区域
+                content = slide_data.get('content', [])
+                if content:
+                    content_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.7), Inches(11.5), Inches(4.8))
+                    tf = content_box.text_frame
+                    tf.word_wrap = True
+                    
+                    for j, point in enumerate(content):
+                        if j == 0:
+                            p = tf.paragraphs[0]
+                        else:
+                            p = tf.add_paragraph()
+                        p.text = f"• {point}"
+                        p.font.name = font_name
+                        p.font.size = Pt(18)
+                        p.font.color.rgb = RGBColor(60, 60, 60)
+                        p.space_after = Pt(10)
+                        p.level = 0
+                
+                # 如果有配图，嵌入 AI 生成的图片
+                image_suggestion = slide_data.get('image_suggestion', '')
+                generated_images = st.session_state.courseware_session.get("generated_images", {})
+                
+                if i in generated_images and generated_images[i].get('success'):
+                    # 嵌入 AI 生成的 PNG 图片
+                    img_path = generated_images[i].get('png_path')
+                    if img_path and os.path.exists(img_path):
+                        slide.shapes.add_picture(img_path, Inches(8.5), Inches(2), Inches(4), Inches(3))
+                    else:
+                        # 图片路径不存在，显示文字占位符
+                        placeholder = slide.shapes.add_shape(
+                            MSO_SHAPE.ROUNDED_RECTANGLE,
+                            Inches(8.5), Inches(2), Inches(4), Inches(3)
+                        )
+                        placeholder.fill.solid()
+                        placeholder.fill.fore_color.rgb = RGBColor(240, 240, 240)
+                        placeholder.line.color.rgb = RGBColor(*hex_to_rgb(accent_color))
+                        img_text = slide.shapes.add_textbox(Inches(8.6), Inches(3.2), Inches(3.8), Inches(1))
+                        tf = img_text.text_frame
+                        p = tf.paragraphs[0]
+                        p.text = f"📷 {image_suggestion}"
+                        p.alignment = PP_ALIGN.CENTER
+                        p.font.name = font_name
+                        p.font.size = Pt(14)
+                        p.font.color.rgb = RGBColor(100, 100, 100)
+                        p.font.italic = True
+                elif image_suggestion and image_suggestion.strip():
+                    # 没有生成图片，显示文字占位符
+                    placeholder = slide.shapes.add_shape(
+                        MSO_SHAPE.ROUNDED_RECTANGLE,
+                        Inches(8.5), Inches(2), Inches(4), Inches(3)
+                    )
+                    placeholder.fill.solid()
+                    placeholder.fill.fore_color.rgb = RGBColor(240, 240, 240)
+                    placeholder.line.color.rgb = RGBColor(*hex_to_rgb(accent_color))
+                    
+                    # 添加图片说明文字
+                    img_text = slide.shapes.add_textbox(Inches(8.6), Inches(3.2), Inches(3.8), Inches(1))
+                    tf = img_text.text_frame
+                    p = tf.paragraphs[0]
+                    p.text = f"📷 {image_suggestion}"
+                    p.alignment = PP_ALIGN.CENTER
+                    p.font.name = font_name
+                    p.font.size = Pt(14)
+                    p.font.color.rgb = RGBColor(100, 100, 100)
+                    p.font.italic = True
+        
+        # 添加动画超链接按钮（如果有动画）
+        animations = st.session_state.courseware_session.get("animations", [])
+        if animations and len(animations) > 0:
+            # 创建 animations 文件夹
+            anim_folder = "animations"
+            if not os.path.exists(anim_folder):
+                os.makedirs(anim_folder)
+            
+            # 保存所有动画的 HTML 文件
+            animation_service = AnimationService()
+            for anim in animations:
+                svg_code = anim.get('svg_code', '')
+                if svg_code:
+                    anim_title = anim.get('title', 'animation').replace(' ', '_')
+                    html_content = animation_service.generate_html_animation(svg_code, anim.get('title', '教学动画'))
+                    html_file = f"{anim_folder}/{anim_title}.html"
+                    
+                    try:
+                        with open(html_file, 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+                        print(f"✅ 动画 HTML 文件已保存：{html_file}")
+                    except Exception as e:
+                        print(f"⚠️ 保存动画 HTML 失败：{str(e)}")
+            
+            # 在对应幻灯片上添加超链接按钮
+            for anim in animations:
+                slide_index = anim.get("related_slide_index", 0) - 1  # 转为 0 索引
+                if 0 <= slide_index < len(prs.slides):
+                    anim_slide = prs.slides[slide_index]
+                    
+                    # 添加按钮形状
+                    button = anim_slide.shapes.add_shape(
+                        MSO_SHAPE.ROUNDED_RECTANGLE,
+                        Inches(10.5), Inches(6.5), Inches(2.3), Inches(0.7)
+                    )
+                    button.fill.solid()
+                    button.fill.fore_color.rgb = RGBColor(30, 136, 229)
+                    button.line.fill.background()
+                    
+                    # 添加文字
+                    tf = button.text_frame
+                    tf.word_wrap = True
+                    p = tf.paragraphs[0]
+                    p.text = "▶ 播放动画"
+                    p.alignment = PP_ALIGN.CENTER
+                    p.font.name = 'Microsoft YaHei'
+                    p.font.color.rgb = RGBColor(255, 255, 255)
+                    p.font.size = Pt(13)
+                    p.font.bold = True
+                    
+                    # 添加超链接（指向 HTML 文件）
+                    anim_title = anim.get('title', 'animation').replace(' ', '_')
+                    html_file = f"animations/{anim_title}.html"
+                    try:
+                        button.click_action.hyperlink.address = html_file
+                        print(f"✅ 已在第 {slide_index + 1} 页添加动画超链接：{html_file}")
+                    except Exception as e:
+                        print(f"⚠️ 添加超链接失败：{str(e)}")
         
         ppt_bytes = io.BytesIO()
         prs.save(ppt_bytes)
@@ -1319,33 +1855,66 @@ if st.session_state.courseware_session.get("generated") and st.session_state.cou
         from docx import Document
         from docx.shared import Pt, Inches
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        import io
+        import re
+        
+        def clean_text(text):
+            """清理文本中的特殊字符和乱码"""
+            if not text:
+                return ""
+            # 如果是 dict 类型，转换为字符串
+            if isinstance(text, dict):
+                text = json.dumps(text, ensure_ascii=False, indent=2)
+            # 确保是字符串
+            if not isinstance(text, str):
+                text = str(text)
+            # 移除不可见字符和控制字符（保留换行符）
+            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+            # 替换常见的乱码符号
+            text = text.replace('☒', '')
+            text = text.replace('', '')
+            text = text.replace('↓', '')
+            # 移除多余的空白字符
+            text = re.sub(r'[ \t]+', ' ', text)
+            return text.strip()
         
         try:
             doc = Document()
             
+            # 设置全局字体为微软雅黑
+            doc.styles['Normal'].font.name = 'Microsoft YaHei'
+            doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+            
             # 添加标题
-            heading = doc.add_heading(f"{topic} - 教案", 0)
+            heading = doc.add_heading(f"{clean_text(topic)} - 教案", 0)
             heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
             
             # 添加基本信息
-            doc.add_paragraph(f"年级：{grade_level}")
-            doc.add_paragraph(f"学科：{subject}")
-            doc.add_paragraph(f"主题：{topic}")
+            doc.add_paragraph(f"年级：{clean_text(grade_level)}")
+            doc.add_paragraph(f"学科：{clean_text(subject)}")
+            doc.add_paragraph(f"主题：{clean_text(topic)}")
             doc.add_paragraph()
             
             # 添加教案大纲内容
             doc.add_heading('一、教学大纲', level=1)
-            doc.add_paragraph(outline)
+            cleaned_outline = clean_text(outline)
+            doc.add_paragraph(cleaned_outline)
             
             # 添加 PPT 详细内容
             doc.add_heading('二、PPT 课件内容详情', level=1)
             for i, slide_data in enumerate(slides, 1):
-                doc.add_heading(f'第{i}页：{slide_data.get("title", "无标题")}', level=2)
-                if slide_data.get('subtitle'):
-                    doc.add_paragraph(f'副标题：{slide_data.get("subtitle")}')
+                slide_title = clean_text(slide_data.get("title", "无标题"))
+                doc.add_heading(f'第{i}页：{slide_title}', level=2)
+                
+                subtitle = slide_data.get('subtitle')
+                if subtitle:
+                    doc.add_paragraph(f'副标题：{clean_text(subtitle)}')
                 content = slide_data.get('content', [])
                 for point in content:
-                    doc.add_paragraph(point, style='List Bullet')
+                    cleaned_point = clean_text(point)
+                    if cleaned_point:  # 只添加非空内容
+                        doc.add_paragraph(cleaned_point, style='List Bullet')
                 doc.add_paragraph()
             
             # 保存为 docx 文件
@@ -1353,7 +1922,7 @@ if st.session_state.courseware_session.get("generated") and st.session_state.cou
             doc.save(docx_bytes)
             docx_bytes.seek(0)
             
-            docx_file_name = f"{topic}_{grade_level}_{subject}_教案.docx"
+            docx_file_name = f"{clean_text(topic)}_{clean_text(grade_level)}_{clean_text(subject)}_教案.docx"
             st.download_button(
                 label="📥 下载 Word 教案（可编辑的 Word 文档）",
                 data=docx_bytes.getvalue(),
@@ -1362,12 +1931,17 @@ if st.session_state.courseware_session.get("generated") and st.session_state.cou
                 help="点击下载配套的详细教案，可在 Microsoft Word 或 WPS 中打开编辑",
                 type="primary"
             )
+        except ImportError as import_error:
+            st.error(f"❌ 缺少必要的依赖库：{str(import_error)}")
+            st.warning("💡 请运行以下命令安装依赖：")
+            st.code("pip install python-docx", language="bash")
         except Exception as docx_error:
-            st.error(f"Word 教案生成失败：{str(docx_error)}")
+            st.error(f"❌ Word 教案生成失败：{str(docx_error)}")
             st.info("💡 建议：可以手动复制上面的教案内容到 Word 文档中")
     except Exception as ppt_error:
         st.error(f"PPT 文件生成失败：{str(ppt_error)}")
         st.info("💡 建议：可以手动复制上面的 PPT 内容到 PowerPoint 中")
+
 
 elif menu == "知识库管理":
     st.title("🗄️ 知识库管理")
@@ -1398,149 +1972,35 @@ elif menu == "知识库管理":
     # 上传文档区域
     st.subheader("📤 上传文档到知识库")
     uploaded_docs = st.file_uploader(
-        "支持上传教学资料、学术论文、参考书籍等",
-        type=["pdf", "doc", "docx", "ppt", "pptx", "txt", "md"],
+        "支持上传教学资料、学术论文、参考书籍、教学图片等",
+        type=["pdf", "doc", "docx", "ppt", "pptx", "txt", "md", "jpg", "jpeg", "png"],
         accept_multiple_files=True,
         key="knowledge_upload",
-        help="上传后 AI 将自动解析并归类到知识库"
+        help="上传后 AI 将自动解析并归类到知识库（图片将使用 OCR 识别文字）"
     )
     
     if uploaded_docs:
-        for file in uploaded_docs:
-            # ✅ 去重检查：检查是否已上传同名文件
-            existing_names = [doc['name'] for doc in st.session_state.knowledge_base["documents"]]
-            if file.name in existing_names:
-                st.warning(f"⚠️ {file.name} 已存在于知识库中，跳过重复上传")
-                continue
-            
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                try:
-                    # 智能分类
-                    file_ext = file.name.split('.')[-1].lower()
-                    category_map = {
-                        'pdf': '📚 学术文献',
-                        'doc': '📖 教学资料',
-                        'docx': '📖 教学资料',
-                        'ppt': '📊 演示文稿',
-                        'pptx': '📊 演示文稿',
-                        'txt': '📝 文本资料',
-                        'md': '📝 文本资料'
-                    }
-                    category = category_map.get(file_ext, '📁 其他')
-                    
-                    # 解析文件为统一的 JSON 格式
-                    with st.spinner(f"正在解析 {file.name}..."):
-                        document_data = doc_parser.parse_to_json(
-                            file=file,
-                            subject="通用",  # 可以根据实际情况设置学科
-                            uploaded_by="teacher"
-                        )
-                    
-                    if document_data:
-                        # ✅ 保存到 RAG 数据库前，再次检查是否已存在
-                        doc_id = None
-                        if st.session_state.rag_kb_connected:
-                            try:
-                                # 检查数据库中是否已存在同名文档
-                                existing_docs = rag_kb.search_documents(file.name, limit=10)
-                                is_duplicate = any(doc.get('title') == file.name for doc in existing_docs)
-                                
-                                if is_duplicate:
-                                    warning(f"⚠️ 数据库中已存在 {file.name}，跳过保存")
-                                else:
-                                    # 保存到 JSON 文件
-                                    json_filepath = doc_parser.save_to_file(document_data)
-                                    
-                                    # 保存到 RAG 数据库
-                                    doc_id = rag_kb.add_document(
-                                        title=file.name,
-                                        subject="通用",
-                                        file_path=json_filepath,
-                                        file_type=file_ext,
-                                        content_text=document_data.get('content', {}).get('raw_text', ''),
-                                        knowledge_points=document_data.get('analysis', {}).get('knowledge_points', []),
-                                        ai_summary=document_data.get('analysis', {}).get('summary', ''),
-                                        uploaded_by="teacher"
-                                    )
-                                    if doc_id:
-                                        info(f"✅ 文档已保存到 RAG 数据库：{file.name} (ID: {doc_id})")
-                            except Exception as db_error:
-                                warning(f"⚠️ RAG 数据库保存失败：{str(db_error)}")
-                                doc_id = None
-                        else:
-                            # 数据库未连接，仅保存到本地
-                            json_filepath = doc_parser.save_to_file(document_data)
-                            warning("⚠️ RAG 数据库未连接，文档仅保存在本地")
-                        
-                        # 添加到 session_state（用于前端显示）
-                        doc_info = {
-                            "name": file.name,
-                            "type": file_ext,
-                            "size": file.size,
-                            "category": category,
-                            "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "json_format": True,  # 标记为 JSON 格式
-                            "json_data": document_data,  # 完整的 JSON 数据
-                            "json_file_path": json_filepath if 'json_filepath' in locals() else '',  # JSON 文件路径
-                            "rag_doc_id": doc_id  # RAG 数据库 ID
-                        }
-                        
-                        st.session_state.knowledge_base["documents"].append(doc_info)
-                        
-                        # 更新分类统计
-                        if category not in st.session_state.knowledge_base["categories"]:
-                            st.session_state.knowledge_base["categories"][category] = 0
-                        st.session_state.knowledge_base["categories"][category] += 1
-                        
-                        if doc_id:
-                            st.success(f"✅ {file.name} (已保存到数据库 + JSON 格式)")
-                        else:
-                            st.success(f"✅ {file.name} (已转换为 JSON 格式)")
-                    else:
-                        st.error(f"❌ {file.name} 解析失败")
-                        
-                except Exception as e:
-                    st.error(f"处理文件 {file.name} 失败：{str(e)}")
-                    error(f"文件解析失败：{file.name} - {str(e)}")
-                    
-            with col2:
-                # 下载按钮（提供原始文件和 JSON 文件两种选择）
-                download_option = st.selectbox(
-                    "",
-                    options=["原始文件", "JSON 格式"],
-                    key=f"download_type_{file.name}",
-                    label_visibility="collapsed"
-                )
-                
-                if download_option == "原始文件":
-                    file.seek(0)  # 重置指针
-                    st.download_button(
-                        label="📥 下载",
-                        data=file.read(),
-                        file_name=file.name,
-                        mime="application/octet-stream",
-                        key=f"knowledge_download_{file.name}"
-                    )
-                else:
-                    # 下载 JSON 格式
-                    if 'json_data' in locals() and json_data:
-                        json_str = doc_parser.to_json_string(json_data)
-                        json_filename = file.name.rsplit('.', 1)[0] + '.json'
-                        st.download_button(
-                            label="📥 下载 JSON",
-                            data=json_str,
-                            file_name=json_filename,
-                            mime="application/json",
-                            key=f"json_download_{file.name}"
-                        )
+        # 调用服务层上传文档
+        knowledge_service = KnowledgeService()
+        result = knowledge_service.upload_documents(
+            uploaded_files=uploaded_docs,
+            category="通用"
+        )
+        
+        if result["success"]:
+            st.success(f"✅ 成功上传 {result['uploaded_count']} 个文档")
+            if result["failed_files"]:
+                st.warning(f"⚠️ 以下文件上传失败：{', '.join(result['failed_files'])}")
+            st.rerun()
+        else:
+            st.error(f"❌ 上传失败：{result.get('error', '未知错误')}")
         
         # 显示已上传的文件列表和管理功能
         if st.session_state.knowledge_base["documents"]:
             st.divider()
             st.subheader("📚 已上传的文件")
             
-            # 批量删除功能
+            # 删除功能
             files_to_delete = st.multiselect(
                 "选择要删除的文件（可多选）",
                 options=[doc["name"] for doc in st.session_state.knowledge_base["documents"]],
@@ -1597,37 +2057,21 @@ elif menu == "知识库管理":
         if st.button("🤖 AI 智能解析并归类", type="primary"):
             with st.spinner("正在解析文档内容并提取知识点..."):
                 try:
-                    client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
-                    
-                    # 构建文档列表
-                    doc_list = "\n".join([f"- {doc['name']} ({doc['type']}, {doc['size']} bytes)" 
-                                        for doc in st.session_state.knowledge_base["documents"]])
-                    
-                    prompt = f"""你是一位专业的知识管理专家。请分析以下上传到知识库的文档，完成以下任务：
-
-文档列表：
-{doc_list}
-
-请提供：
-1. 📋 **文档分类建议**（按学科、难度、用途等维度）
-2. 🎯 **核心知识点提取**（从所有文档中提取关键知识点）
-3. 🔗 **知识关联分析**（文档之间的关联性和互补性）
-4. 💡 **使用建议**（如何在教学中有效利用这些资源）
-5. 📊 **知识结构图**（建议的知识组织方式）
-
-要求：结构清晰，便于教师快速定位和使用。"""
-                    
-                    response = client.chat.completions.create(
-                        model="moonshot-v1-8k",  # Kimi 模型
-                        messages=[{"role": "user", "content": prompt}]
+                    # 调用服务层分析文档
+                    knowledge_service = KnowledgeService()
+                    result = knowledge_service.analyze_documents(
+                        documents=st.session_state.knowledge_base["documents"],
+                        api_key=DEFAULT_API_KEY,
+                        base_url=BASE_URL
                     )
                     
-                    analysis = response.choices[0].message.content
-                    
-                    st.success("✅ AI 解析完成！")
-                    with st.expander("📖 查看 AI 解析结果", expanded=True):
-                        st.markdown(analysis)
-                    
+                    if result["success"]:
+                        st.success("✅ AI 解析完成！")
+                        with st.expander("📖 查看 AI 解析结果", expanded=True):
+                            st.markdown(result["analysis"])
+                    else:
+                        st.error(f"❌ 解析失败：{result.get('error', '未知错误')}")
+                        
                 except Exception as e:
                     st.error(f"解析失败：{str(e)}")
     
@@ -1653,36 +2097,24 @@ elif menu == "知识库管理":
     
     if search_query and st.button("🔍 搜索", type="primary"):
         with st.spinner("正在 RAG 知识库中检索..."):
-            # 从 RAG 数据库搜索
+            # 调用服务层搜索文档
+            knowledge_service = KnowledgeService()
             subject = None if search_subject == "全部" else search_subject
-            results = rag_kb.search_documents(search_query, subject=subject, limit=10)
-            
+            results = knowledge_service.search_documents(
+                query=search_query,
+                subject=subject,
+                limit=10
+            )
+                
             if results:
                 st.success(f"✅ 找到 {len(results)} 篇相关文档")
-                
+                    
                 # 显示搜索结果
                 for i, doc in enumerate(results, 1):
-                    col1, col2 = st.columns([4, 1])
-                    
-                    with col1:
-                        with st.expander(f"📄 {i}. {doc.get('title', '无标题')} - {doc.get('subject', '未知学科')}"):
-                            st.markdown(f"**摘要:** {doc.get('ai_summary', '暂无摘要')}")
-                            
-                            # 使用次数 +1
-                            rag_kb.update_document_usage(doc['id'])
-                    
-                    with col2:
-                        # 提供下载按钮
-                        file_name = f"{doc.get('title', '文档')}_{doc.get('subject', '未知')}.txt"
-                        content = doc.get('content_text', doc.get('ai_summary', '暂无内容'))
-                        st.download_button(
-                            label="📥 下载",
-                            data=content,
-                            file_name=file_name,
-                            mime="text/plain",
-                            key=f"download_rag_{doc.get('id', i)}",
-                            use_container_width=True
-                        )
+                    with st.expander(f"📄 {i}. {doc.get('title', '无标题')} - {doc.get('subject', '未知学科')}"):
+                        st.markdown(doc.get('content_text', '')[:1000])
+                        if len(doc.get('content_text', '')) > 1000:
+                            st.caption("...（内容过长，仅显示前1000字）")
             else:
                 st.info(f"💡 未在 RAG 知识库中找到相关文档，请尝试其他关键词或上传更多资料。")
     
@@ -1715,8 +2147,6 @@ elif menu == "知识库管理":
                 display_data = {
                     "📄 文档名称": [d["name"] for d in filtered_docs],
                     "📂 分类": [d["category"] for d in filtered_docs],
-                    "📝 类型": [f".{d['type']}" for d in filtered_docs],
-                    "💾 大小": [f"{d['size']/1024:.1f} KB" if d['size'] < 1024*1024 else f"{d['size']/1024/1024:.2f} MB" for d in filtered_docs],
                     "⏰ 上传时间": [d["upload_time"] for d in filtered_docs]
                 }
                 st.dataframe(display_data, use_container_width=True, hide_index=True)
@@ -1780,75 +2210,91 @@ elif menu == "学情分析":
     
     # AI 生成学情报告
     if st.button("🤖 AI 生成学情报告", type="primary"):
+        # 验证：必须有文件或输入信息
+        has_file = uploaded_files and len(uploaded_files) > 0
+        has_student = (analysis_mode == "单个学生" and student_name.strip())
+        has_class = (analysis_mode == "全班评估" and class_name.strip())
+        has_interactive_data = len(st.session_state.learning_data.get("questions", [])) > 0
+        
+        if not has_file and not has_student and not has_class:
+            st.error("❌ 请至少完成以下一项：\n1. 上传成绩/学习数据文件\n2. 输入学生姓名（单个学生模式）\n3. 输入班级名称（全班评估模式）")
+            st.stop()
+        
         with st.spinner("正在分析学习数据并生成报告..."):
             try:
-                client = OpenAI(api_key=DEFAULT_API_KEY, base_url=BASE_URL)
-                
-                # 构建分析请求
+                # 构建学生信息
                 if analysis_mode == "单个学生":
-                    target = f"学生：{student_name if student_name else '某同学'}"
+                    student_info = {"name": student_name if student_name else "某同学"}
                 else:
-                    target = f"班级：{class_name if class_name else '某班'}（共{total_students}人）"
+                    student_info = {
+                        "class_name": class_name if class_name else "某班",
+                        "total_students": total_students
+                    }
                 
-                # 基础数据摘要
-                data_summary = f"【学情分析对象】{target}\n\n"
-                data_summary += f"【互动数据】\n"
-                data_summary += f"- 总问题数：{len(questions)}\n"
-                if questions:
-                    scenarios = {}
-                    for q in questions:
-                        scenario = q.get('scenario', '未知')
-                        scenarios[scenario] = scenarios.get(scenario, 0) + 1
-                    data_summary += "- 互动场景分布：\n"
-                    for s, c in scenarios.items():
-                        data_summary += f"  · {s}: {c}次\n"
-                
-                # 处理上传的文件
-                file_info = ""
-                if uploaded_files:
-                    file_info = "\n【上传的成绩/学习数据文件】\n"
-                    for file in uploaded_files:
-                        file_info += f"- {file.name} ({file.size} bytes)\n"
-                        # 读取文本类型文件内容
-                        if file.type in ["text/plain", "text/csv"]:
-                            try:
-                                content = file.read().decode('utf-8')[:2000]
-                                file_info += f"  内容预览：{content[:500]}...\n"
-                            except:
-                                pass
-                
-                prompt = f"""你是一位专业的教育数据分析师。请根据以下数据和信息，生成一份详细的学情分析报告。
-
-{target}
-
-{data_summary}
-{file_info}
-
-请生成包含以下内容的报告：
-1. 📊 **整体情况概览**（包括平均分、优秀率、及格率等关键指标）
-2. 📈 **成绩分布分析**（分数段统计、正态分布分析）
-3. 🎯 **知识点掌握情况**（优势知识点、薄弱知识点 TOP5）
-4. 👥 **学生分层分析**（学优生、中等生、学困生比例及特点）
-5. 📉 **典型问题分析**（错误率高的题目类型和原因）
-6. 💡 **个性化教学建议**（针对不同层次学生的具体建议）
-7. 📋 **后续教学计划**（重点讲解内容、练习安排）
-
-要求：数据可视化呈现，使用图表、表格等形式，语言简洁专业。"""
-                
-                response = client.chat.completions.create(
-                    model="moonshot-v1-8k",  # Kimi 模型
-                    messages=[{"role": "user", "content": prompt}]
+                # 调用服务层生成报告
+                analysis_service = AnalysisService()
+                result = analysis_service.generate_report(
+                    analysis_mode=analysis_mode,
+                    student_info=student_info,
+                    uploaded_files=uploaded_files,
+                    questions_data=st.session_state.learning_data.get("questions", []),
+                    api_key=DEFAULT_API_KEY,
+                    base_url=BASE_URL
                 )
                 
-                report = response.choices[0].message.content
-                
-                st.success("✅ 学情报告生成完成！")
-                
-                # 显示报告
-                st.markdown(report)
-                
-                # 添加图表生成提示
-                st.info("💡 **提示**：以上数据可由 AI 协助制作可视化图表，建议使用 Excel、Python matplotlib 等工具根据分析报告中的数据绘制：\n- 成绩分布直方图\n- 知识点掌握雷达图\n- 学生分层饼图\n- 成绩变化趋势图")
-                
+                if result["success"]:
+                    st.success("✅ 学情报告生成完成！")
+                    
+                    # 显示报告
+                    st.markdown(result["report"])
+                    
+                    # 自动生成并展示分析图表
+                    charts = generate_analysis_charts(
+                        questions_data=st.session_state.learning_data.get("questions", []),
+                        analysis_mode=analysis_mode
+                    )
+                    display_analysis_charts(charts)
+                else:
+                    st.error(f"生成失败：{result.get('error', '未知错误')}")
+                    
             except Exception as e:
                 st.error(f"生成失败：{str(e)}")
+    
+    # 全局数据管理
+    st.divider()
+    with st.expander("🗄️ 全局数据管理"):
+        st.subheader("💾 数据备份与恢复")
+        col_backup1, col_backup2, col_backup3 = st.columns(3)
+        
+        with col_backup1:
+            if st.button("💾 备份所有数据", use_container_width=True):
+                analysis_service = AnalysisService()
+                result = analysis_service.manage_learning_data("backup")
+                if result["success"]:
+                    st.success("✅ 学习数据已备份到 learning_data_backup.json")
+                else:
+                    st.error(f"备份失败：{result.get('error')}")
+        
+        with col_backup2:
+            if st.button("📤 导出完整数据", use_container_width=True):
+                full_data = {
+                    "learning_data": st.session_state.learning_data,
+                    "knowledge_base": st.session_state.knowledge_base,
+                    "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                export_str = json.dumps(full_data, ensure_ascii=False, indent=2)
+                st.download_button(
+                    label="📥 下载完整数据",
+                    data=export_str,
+                    file_name=f"完整数据备份_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
+        
+        with col_backup3:
+            if st.button("🗑️ 清空所有数据", use_container_width=True, type="secondary"):
+                if st.checkbox("确认清空所有数据？", key="confirm_clear_all"):
+                    analysis_service = AnalysisService()
+                    result = analysis_service.manage_learning_data("clear")
+                    if result["success"]:
+                        st.success("✅ 所有数据已清空")
+                        st.rerun()

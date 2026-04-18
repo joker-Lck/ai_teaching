@@ -4,11 +4,14 @@ RAG 知识库数据库初始化脚本
 """
 
 import mysql.connector
-from db_config import DB_CONFIG
+from data.config import get_rag_db_config
 
 def init_rag_database():
     """初始化 RAG 知识库数据库"""
     try:
+        # 获取配置
+        DB_CONFIG = get_rag_db_config()
+        
         # 连接 MySQL（不指定数据库）
         conn = mysql.connector.connect(
             host=DB_CONFIG['host'],
@@ -35,7 +38,10 @@ def init_rag_database():
             subject VARCHAR(50) NOT NULL COMMENT '所属学科',
             file_path VARCHAR(1000) COMMENT '文件存储路径',
             file_type VARCHAR(20) COMMENT '文件类型 (pdf/doc/ppt/txt)',
+            file_size BIGINT DEFAULT 0 COMMENT '文件大小（字节）',
             document_data JSON COMMENT '文档完整数据（JSON格式）',
+            embedding JSON COMMENT '文档向量（Embedding）',
+            embedding_model VARCHAR(100) DEFAULT 'kimi-embedding' COMMENT '向量模型名称',
             uploaded_by VARCHAR(100) DEFAULT 'teacher' COMMENT '上传者',
             upload_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
             usage_count INT DEFAULT 0 COMMENT '使用次数',

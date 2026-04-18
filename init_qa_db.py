@@ -3,10 +3,13 @@ AI 答疑专用数据库初始化脚本
 """
 
 import mysql.connector
-from qa_db_config import QA_DB_CONFIG
+from data.config import get_qa_db_config
 
 def init_qa_database():
     """初始化 AI 答疑专用数据库"""
+    
+    # 获取配置
+    QA_DB_CONFIG = get_qa_db_config()
     
     # 连接 MySQL（不指定数据库）
     conn = mysql.connector.connect(
