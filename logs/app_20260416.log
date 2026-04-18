@@ -1,5 +1,0 @@
-2026-04-16 20:14:19,474 - AI_Teaching_Assistant - ERROR - 数据库连接失败：2003: Can't connect to MySQL server on 'localhost:3306' (10061 由于目标计算机积极拒绝，无法连接。)
-2026-04-16 20:14:19,480 - AI_Teaching_Assistant - ERROR - ❌ 数据库操作失败：connect - 2003: Can't connect to MySQL server on 'localhost:3306' (10061 由于目标计算机积极拒绝，无法连接。)
-2026-04-16 20:14:19,480 - AI_Teaching_Assistant - ERROR - ❌ 主数据库连接失败
-2026-04-16 20:14:21,528 - AI_Teaching_Assistant - ERROR - ❌ 答疑数据库连接失败
-2026-04-16 20:14:23,572 - AI_Teaching_Assistant - ERROR - ❌ RAG 知识库连接失败
