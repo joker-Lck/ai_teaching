@@ -1,0 +1,10 @@
+2026-04-28 19:59:00,664 - mysql.connector - INFO - package: mysql.connector.plugins
+2026-04-28 19:59:00,664 - mysql.connector - INFO - plugin_name: mysql_native_password
+2026-04-28 19:59:00,666 - mysql.connector - INFO - AUTHENTICATION_PLUGIN_CLASS: MySQLNativePasswordAuthPlugin
+2026-04-28 19:59:24,260 - AI_Teaching_Assistant - INFO - ✅ 主数据库连接成功
+2026-04-28 19:59:24,260 - AI_Teaching_Assistant - INFO - ✅ 答疑数据库连接成功
+2026-04-28 19:59:24,261 - AI_Teaching_Assistant - INFO - ✅ RAG 知识库连接成功
+2026-04-28 19:59:24,262 - AI_Teaching_Assistant - INFO - ✅ 数据库连接成功：ai_teaching_assistant
+2026-04-28 19:59:24,263 - AI_Teaching_Assistant - INFO - ✅ 数据库连接成功：ai_qa_records
+2026-04-28 19:59:24,265 - AI_Teaching_Assistant - INFO - ✅ 数据库连接成功：ai_rag_knowledge
+2026-04-28 19:59:24,277 - AI_Teaching_Assistant - INFO - ✅ 从 RAG 数据库恢复了 93 个文档

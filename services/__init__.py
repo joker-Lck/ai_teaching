@@ -8,3 +8,4 @@ from services.knowledge_service import KnowledgeService
 from services.analysis_service import AnalysisService
 from services.image_service import ImageService
 from services.animation_service import AnimationService
+from services.auth_service import AuthService, auth_service

@@ -11,6 +11,7 @@ from data.rag_knowledge_base import rag_kb
 from data.document_parser import doc_parser
 from data.embedding_service import embedding_service
 from services.animation_service import AnimationService
+from services.auth_service import auth_service
 from core.ui_components import CustomCSS, PageLayout, UIComponents
 from data.data_manager import LearningDataManager, DatabaseManager, CacheManager
 from core.utils import clean_json_string, format_file_size, extract_urls, truncate_text, safe_get, generate_filename
@@ -81,6 +82,108 @@ def load_rag_documents_paginated(offset=0, limit=20):
 config = CacheManager.load_env_config()
 DEFAULT_API_KEY = config['api_key']
 BASE_URL = config['base_url']
+
+# 初始化登录状态
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.current_user = None
+
+# 如果未登录，显示登录界面
+if not st.session_state.logged_in:
+    st.set_page_config(page_title="AI 教学智能体 - 登录", page_icon="🎓", layout="centered")
+    
+    # 登录页面
+    st.markdown("""
+    <div style='text-align: center; padding: 50px 0;'>
+        <h1 style='color: #0a192f; font-size: 48px;'>🎓 多模态 AI 教学智能体</h1>
+        <p style='color: #666; font-size: 18px;'>AI 赋能教育，智能引领未来</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 登录/注册选项卡
+    auth_tab = st.tabs([" 登录", "📝 注册"])
+    
+    with auth_tab[0]:
+        st.subheader("用户登录")
+        
+        with st.form("login_form"):
+            username = st.text_input("用户名", placeholder="请输入用户名")
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                login_btn = st.form_submit_button("登录", type="primary", use_container_width=True)
+            with col2:
+                guest_btn = st.form_submit_button("游客模式", use_container_width=True)
+            
+            if login_btn:
+                if not username or not password:
+                    st.error(" 请输入用户名和密码")
+                else:
+                    with st.spinner("正在登录..."):
+                        result = auth_service.login_user(username, password)
+                        
+                        if result['success']:
+                            st.session_state.logged_in = True
+                            st.session_state.current_user = result['user']
+                            st.success(f"✅ {result['message']}，欢迎 {result['user']['username']}！")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {result['message']}")
+            
+            if guest_btn:
+                st.session_state.logged_in = True
+                st.session_state.current_user = {
+                    'id': 0,
+                    'username': '游客',
+                    'role': 'guest',
+                    'email': None
+                }
+                st.success("✅ 已进入游客模式")
+                time.sleep(1)
+                st.rerun()
+    
+    with auth_tab[1]:
+        st.subheader("新用户注册")
+        
+        with st.form("register_form"):
+            reg_username = st.text_input("用户名", placeholder="请输入用户名（3-20个字符）")
+            reg_password = st.text_input("密码", type="password", placeholder="请输入密码（至少6位）")
+            reg_password_confirm = st.text_input("确认密码", type="password", placeholder="请再次输入密码")
+            reg_email = st.text_input("邮箱（可选）", placeholder="请输入邮箱地址")
+            reg_role = st.radio("用户角色", ["教师", "学生"], index=0)
+            
+            register_btn = st.form_submit_button("注册", type="primary")
+            
+            if register_btn:
+                # 验证输入
+                if not reg_username or not reg_password or not reg_password_confirm:
+                    st.error("❌ 请填写必填项")
+                elif len(reg_username) < 3 or len(reg_username) > 20:
+                    st.error("❌ 用户名长度应在 3-20 个字符之间")
+                elif len(reg_password) < 6:
+                    st.error("❌ 密码长度至少 6 位")
+                elif reg_password != reg_password_confirm:
+                    st.error("❌ 两次输入的密码不一致")
+                else:
+                    role_map = {"教师": "teacher", "学生": "student"}
+                    with st.spinner("正在注册..."):
+                        result = auth_service.register_user(
+                            reg_username, 
+                            reg_password, 
+                            reg_email if reg_email else None,
+                            role_map[reg_role]
+                        )
+                        
+                        if result['success']:
+                            st.success(f"✅ {result['message']}！请登录")
+                        else:
+                            st.error(f"❌ {result['message']}")
+    
+    st.stop()  # 停止执行后续代码
+
+# 已登录，继续加载主应用
 
 # 初始化学习数据
 if "learning_data" not in st.session_state:
@@ -191,6 +294,27 @@ st.set_page_config(page_title="多模态 AI 互动式教学智能体", page_icon
 
 # 侧边栏
 with st.sidebar:
+    # 用户信息区域
+    if st.session_state.current_user:
+        user = st.session_state.current_user
+        user_info_col1, user_info_col2 = st.columns([3, 1])
+        
+        with user_info_col1:
+            role_icon = {"teacher": "👨🏫", "student": "‍🎓", "admin": "👑", "guest": "👤"}
+            icon = role_icon.get(user.get('role', 'guest'), '👤')
+            st.markdown(f"{icon} **{user.get('username', '用户')}**")
+            if user.get('role') and user.get('role') != 'guest':
+                role_text = {"teacher": "教师", "student": "学生", "admin": "管理员"}
+                st.caption(f"角色：{role_text.get(user.get('role'), '用户')}")
+        
+        with user_info_col2:
+            if st.button("退出", key="logout_btn", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        
+        st.divider()
+    
     # 主标题
     st.title(" AI 智能教育助手")
     
@@ -213,16 +337,34 @@ with st.sidebar:
     st.caption("让 AI 助力您的教学之旅 🚀")
     st.divider()
     
-    st.title("导航菜单")
+    # 检查是否为游客模式
+    is_guest = st.session_state.current_user and st.session_state.current_user.get('role') == 'guest'
     
-    menu = st.radio(
-        "选择功能",
-        ["智能答疑", "课件生成", "学情分析", "知识库管理"],
-        index=0,
-        label_visibility="collapsed",
-        horizontal=True,
-        key="menu_selection"
-    )
+    if is_guest:
+        st.info(" 游客模式：仅开放体验功能")
+        st.warning("请注册/登录以使用完整功能")
+        st.divider()
+        
+        # 游客只能使用智能答疑
+        menu = st.radio(
+            "选择功能",
+            ["智能答疑"],  # 只有这一个选项
+            index=0,
+            label_visibility="collapsed",
+            horizontal=True,
+            key="menu_selection"
+        )
+    else:
+        st.title("导航菜单")
+        
+        menu = st.radio(
+            "选择功能",
+            ["智能答疑", "课件生成", "学情分析", "知识库管理"],
+            index=0,
+            label_visibility="collapsed",
+            horizontal=True,
+            key="menu_selection"
+        )
 
 # 辅助函数
 
@@ -882,6 +1024,25 @@ if menu == "智能答疑":
                     st.error(f"解析失败：{str(e)}")
 
 elif menu == "课件生成":
+    # 检查游客模式
+    if is_guest:
+        st.title("📚 AI 课件生成")
+        st.warning("⚠️ 游客模式无法使用此功能")
+        st.info("💡 请注册或登录以使用课件生成功能")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📝 立即注册", type="primary", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        with col2:
+            if st.button("🔐 去登录", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        st.stop()
+    
     st.title("📚 AI 课件生成")
     
     # ✅ 加载历史课件按钮
@@ -1944,6 +2105,25 @@ if menu == "课件生成" and st.session_state.courseware_session.get("generated
 
 
 elif menu == "知识库管理":
+    # 检查游客模式
+    if is_guest:
+        st.title("🗄️ 知识库管理")
+        st.warning("⚠️ 游客模式无法使用此功能")
+        st.info("💡 请注册或登录以使用知识库管理功能")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📝 立即注册", type="primary", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        with col2:
+            if st.button("🔐 去登录", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        st.stop()
+    
     st.title("🗄️ 知识库管理")
     
     # 初始化 RAG 知识库
@@ -2158,6 +2338,25 @@ elif menu == "知识库管理":
         st.info("📭 知识库为空，请上传文档")
 
 elif menu == "学情分析":
+    # 检查游客模式
+    if is_guest:
+        st.title("📊 AI 学情分析")
+        st.warning("⚠️ 游客模式无法使用此功能")
+        st.info("💡 请注册或登录以使用学情分析功能")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📝 立即注册", type="primary", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        with col2:
+            if st.button("🔐 去登录", use_container_width=True):
+                st.session_state.logged_in = False
+                st.session_state.current_user = None
+                st.rerun()
+        st.stop()
+    
     st.title("📊 AI 学情分析")
     
     # 选择分析模式
