@@ -5,7 +5,7 @@
 
 import hashlib
 import secrets
-from data.config import get_db_config
+from data.config import get_accounts_db_config
 import mysql.connector
 from datetime import datetime
 
@@ -15,7 +15,7 @@ class AuthService:
     
     def __init__(self):
         """初始化认证服务"""
-        self.db_config = get_db_config()
+        self.db_config = get_accounts_db_config()
     
     def _get_connection(self):
         """获取数据库连接"""

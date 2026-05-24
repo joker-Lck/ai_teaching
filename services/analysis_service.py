@@ -2,11 +2,9 @@
 学情分析服务模块
 处理所有与学情分析相关的业务逻辑
 """
-import streamlit as st
 from datetime import datetime
 from core.prompts import AnalysisPrompts
 from openai import OpenAI
-from data.data_manager import LearningDataManager
 
 
 class AnalysisService:
@@ -84,7 +82,11 @@ class AnalysisService:
             result["success"] = True
             
             # 自动备份学习数据
-            LearningDataManager.save_learning_data()
+            try:
+                from data.data_manager import LearningDataManager
+                LearningDataManager.save_learning_data()
+            except Exception:
+                pass
             
         except Exception as e:
             result["error"] = str(e)
@@ -117,22 +119,21 @@ class AnalysisService:
     def manage_learning_data(self, action, **kwargs):
         """管理学习数据"""
         result = {"success": False, "data": None, "error": None}
-        
+
         try:
             if action == "backup":
-                # 备份数据
+                from data.data_manager import LearningDataManager
                 success = LearningDataManager.save_learning_data()
                 result["success"] = success
-                
+
             elif action == "restore":
-                # 恢复数据
+                from data.data_manager import LearningDataManager
                 success = LearningDataManager.load_learning_data()
                 result["success"] = success
-                
+
             elif action == "export":
-                # 导出数据
                 format_type = kwargs.get("format", "json")
-                learning_data = st.session_state.get("learning_data", {})
+                learning_data = kwargs.get("learning_data", {})
                 
                 if format_type == "json":
                     import json
@@ -150,13 +151,7 @@ class AnalysisService:
                 result["success"] = True
                 
             elif action == "clear":
-                # 清空数据
-                st.session_state.learning_data = {
-                    "questions": [],
-                    "interactions": [],
-                    "correct_rate": 0,
-                    "study_time": 0
-                }
+                # 清空数据 — 由调用方管理状态
                 result["success"] = True
                 
         except Exception as e:

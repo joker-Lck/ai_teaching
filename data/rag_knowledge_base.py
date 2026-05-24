@@ -42,6 +42,8 @@ def _clear_search_cache():
 class RAGKnowledgeBase:
     def __init__(self):
         self.conn_pool = None
+        self.conn = None
+        self.cursor = None
         self._init_pool()
     
     def _init_pool(self):
@@ -70,8 +72,19 @@ class RAGKnowledgeBase:
             self.cursor = self.conn.cursor(dictionary=True)
             return True
         except Exception as e:
-            print(f"❌ RAG 知识库连接失败：{str(e)}")
-            return False
+            self.conn = None
+            self.cursor = None
+            raise ConnectionError(f"RAG 知识库连接失败：{str(e)}")
+
+    def _ensure_connected(self):
+        """确保数据库已连接，返回 True/False"""
+        if self.cursor is not None and self.conn is not None:
+            try:
+                self.conn.ping(reconnect=False)
+                return True
+            except Exception:
+                pass
+        return self.connect()
     
     def close(self):
         """关闭连接"""

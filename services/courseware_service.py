@@ -1,7 +1,6 @@
 """
 课件生成服务模块
 """
-import streamlit as st
 from datetime import datetime
 import time
 import json
@@ -10,6 +9,7 @@ import re
 from openai import OpenAI
 from data.db_operations import db
 from core.prompts import CoursewarePrompts, ClarificationPrompts, DocumentAnalysisPrompts
+from core.enhanced_prompts import EnhancedCoursewarePrompts
 from services.image_service import ImageService
 from services.animation_service import AnimationService
 from core.utils import clean_json_string, safe_json_loads
@@ -173,12 +173,12 @@ class CoursewareService:
             result["subject"] = subject
             result["outline"] = outline
             
-            # Step 2: PPT 结构生成
-            ppt_prompt = CoursewarePrompts.get_ppt_prompt(
+            # Step 2: PPT 结构生成（使用增强提示词）
+            ppt_prompt = EnhancedCoursewarePrompts.get_enhanced_ppt_prompt(
                 subject=subject,
                 topic=topic,
                 requirements_text=requirements_text,
-                fast_mode=fast_mode  # 传递快速模式参数
+                fast_mode=fast_mode
             )
             
             ppt_response = client.chat.completions.create(

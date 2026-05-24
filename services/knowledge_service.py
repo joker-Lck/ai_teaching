@@ -1,5 +1,4 @@
 """知识库管理服务模块"""
-import streamlit as st
 from data.rag_knowledge_base import rag_kb
 from data.document_parser import doc_parser
 from core.prompts import DocumentAnalysisPrompts

@@ -1,7 +1,7 @@
 """
-UI 组件模块
+UI 组件模块（已迁移至 frontend/ Next.js 前端）
+此文件保留作为历史参考，不再被使用。
 """
-import streamlit as st
 
 
 class CustomCSS:

@@ -46,6 +46,18 @@ def get_rag_db_config():
     }
 
 
+def get_accounts_db_config():
+    """获取账户数据库配置"""
+    return {
+        'host': os.getenv('ACCOUNTS_DB_HOST', 'localhost'),
+        'port': int(os.getenv('ACCOUNTS_DB_PORT', '3306')),
+        'user': os.getenv('ACCOUNTS_DB_USER', 'root'),
+        'password': os.getenv('ACCOUNTS_DB_PASSWORD', '123456'),
+        'database': os.getenv('ACCOUNTS_DB_NAME', 'ai_accounts'),
+        'charset': 'utf8mb4'
+    }
+
+
 def get_connection_string(db_type='main'):
     """获取数据库连接字符串"""
     if db_type == 'qa':

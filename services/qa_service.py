@@ -1,7 +1,6 @@
 """
 智能答疑服务模块
 """
-import streamlit as st
 from datetime import datetime
 import time
 import re
@@ -9,16 +8,28 @@ from openai import OpenAI
 from data.qa_db_operations import qa_db
 from data.rag_knowledge_base import rag_kb
 from core.prompts import VoiceQAPrompts
-from data.data_manager import LearningDataManager
 from core.utils import clean_json_string, extract_urls
 
 
 class QAService:
     """智能答疑业务逻辑服务"""
-    
+
+    # 内存中的消息历史（按会话隔离）
+    _sessions: dict = {}
+
     def __init__(self):
         """初始化服务"""
         self.client = None
+
+    def _get_messages(self, session_id: str = "default") -> list:
+        """获取指定会话的消息列表"""
+        if session_id not in self._sessions:
+            self._sessions[session_id] = []
+        return self._sessions[session_id]
+
+    def _clear_messages(self, session_id: str = "default"):
+        """清空指定会话的消息"""
+        self._sessions[session_id] = []
     
     def _get_client(self, api_key, base_url):
         """获取 OpenAI 客户端"""
@@ -26,14 +37,11 @@ class QAService:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         return self.client
     
-    def handle_text_question(self, question, scenario, api_key, base_url):
+    def handle_text_question(self, question, scenario, api_key, base_url, session_id="default"):
         """处理文字提问（支持多轮对话）"""
         start_time = time.time()
-        
-        # 初始化消息列表
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-        
+        messages = self._get_messages(session_id)
+
         result = {
             "success": False,
             "answer": "",
@@ -43,12 +51,12 @@ class QAService:
             "response_time_ms": 0,
             "error": None
         }
-        
+
         try:
             client = self._get_client(api_key, base_url)
-            
+
             # 1. 查询 QA 数据库（历史问答）- 仅在第一轮或无上下文时使用
-            if len(st.session_state.messages) == 0:
+            if len(messages) == 0:
                 similar_qa = qa_db.search_similar_questions(question, limit=2)
                 
                 if similar_qa and len(similar_qa) > 0:
@@ -67,8 +75,8 @@ class QAService:
                                            result["tokens_used"], result["response_time_ms"])
                         
                         # 添加到消息历史
-                        st.session_state.messages.append({"role": "user", "content": question})
-                        st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+                        messages.append({"role": "user", "content": question})
+                        messages.append({"role": "assistant", "content": result["answer"]})
                         
                         return result
             
@@ -99,17 +107,17 @@ class QAService:
             
             # 3. 构建多轮对话消息
             # 添加用户新问题到历史
-            st.session_state.messages.append({"role": "user", "content": question})
-            
+            messages.append({"role": "user", "content": question})
+
             # 如果有 RAG 上下文，在系统消息中加入
             system_content = "你是一位专业的教育 AI 助手。请根据对话历史和参考资料回答问题。"
             if rag_context:
                 system_content += f"\n\n{rag_context}"
-            
+
             # 构建完整的消息列表（包含系统消息 + 历史对话）
             messages_with_history = [
                 {"role": "system", "content": system_content}
-            ] + st.session_state.messages
+            ] + messages
             
             # 限制历史长度，避免超出 token 限制（保留最近 10 轮对话）
             max_history_messages = 20  # 10 轮对话 = 20 条消息
@@ -139,7 +147,7 @@ class QAService:
             result["success"] = True
             
             # 5. 保存 AI 回复到消息历史
-            st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+            messages.append({"role": "assistant", "content": result["answer"]})
             
             # 6. 保存记录到数据库
             self._save_qa_record(question, result["answer"], scenario, 
@@ -149,38 +157,36 @@ class QAService:
             result["error"] = str(e)
             result["success"] = False
             # 如果失败，移除刚才添加的用户消息
-            if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-                st.session_state.messages.pop()
-        
+            if messages and messages[-1]["role"] == "user":
+                messages.pop()
+
         return result
-    
-    def handle_voice_question(self, transcribed_text, api_key, base_url, rag_context=None):
+
+    def handle_voice_question(self, transcribed_text, api_key, base_url, rag_context=None, session_id="default"):
         """处理语音提问"""
-        # 初始化消息列表
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-        
+        messages = self._get_messages(session_id)
+
         result = {
             "success": False,
             "answer": "",
             "error": None
         }
-        
+
         try:
             client = self._get_client(api_key, base_url)
-            
+
             # 添加用户消息到历史
-            st.session_state.messages.append({"role": "user", "content": transcribed_text})
-            
+            messages.append({"role": "user", "content": transcribed_text})
+
             # 构建系统消息
             system_content = "你是一位专业的教育 AI 助手，擅长回答学生的各种问题。"
             if rag_context:
                 system_content += f"\n\n{rag_context}"
-            
+
             # 构建完整的消息列表（包含系统消息 + 历史对话）
             messages_with_history = [
                 {"role": "system", "content": system_content}
-            ] + st.session_state.messages
+            ] + messages
             
             # 限制历史长度
             max_history_messages = 20
@@ -198,35 +204,31 @@ class QAService:
             result["success"] = True
             
             # 保存 AI 回复到消息历史
-            st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
-            
+            messages.append({"role": "assistant", "content": result["answer"]})
+
         except Exception as e:
             result["error"] = str(e)
             result["success"] = False
             # 如果失败，移除刚才添加的用户消息
-            if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-                st.session_state.messages.pop()
-        
+            if messages and messages[-1]["role"] == "user":
+                messages.pop()
+
         return result
-    
-    def manage_chat_history(self, action, **kwargs):
+
+    def manage_chat_history(self, action, session_id="default", **kwargs):
         """管理聊天记录"""
         result = {"success": False, "data": None, "error": None}
-        
+        messages = self._get_messages(session_id)
+
         try:
             if action == "search":
-                # 搜索聊天记录
                 keyword = kwargs.get("keyword", "")
-                messages = st.session_state.get("messages", [])
                 filtered = [msg for msg in messages if keyword.lower() in msg.get("content", "").lower()]
                 result["data"] = filtered
                 result["success"] = True
-                
+
             elif action == "export":
-                # 导出聊天记录
                 format_type = kwargs.get("format", "txt")
-                messages = st.session_state.get("messages", [])
-                
                 if format_type == "json":
                     import json
                     result["data"] = json.dumps(messages, ensure_ascii=False, indent=2)
@@ -236,12 +238,10 @@ class QAService:
                         role = "用户" if msg["role"] == "user" else "AI"
                         text_lines.append(f"[{role}] {msg['content']}\n")
                     result["data"] = "\n".join(text_lines)
-                
                 result["success"] = True
-                
+
             elif action == "clear":
-                # 清空聊天记录
-                st.session_state.messages = []
+                self._clear_messages(session_id)
                 result["success"] = True
                 
         except Exception as e:
